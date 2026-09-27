@@ -82,7 +82,7 @@ function Get-AppVersion {
             if ($m) { return $m.Matches[0].Groups[1].Value }
         }
     } catch { }
-    return '1.1.1'
+    return '1.3.0'
 }
 
 function New-StartMenuShortcut {
@@ -162,9 +162,10 @@ function Register-ScheduledTaskElevated {
     $py = Join-Path $AppDir 'runtime\python.exe'
     if (-not (Test-Path $ps1)) { return '找不到 setup_task.ps1' }
     $log = Join-Path $AppDir 'install_log.txt'
+    # 刻意不带执行策略参数、也不带窗口样式参数 —— 这两样叠起来是杀毒软件的高危特征。
+    # 本机自己的 .ps1 在默认 RemoteSigned 策略下本来就能执行；提权本身必须保留。
     Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
-        '-File', "`"$ps1`"", '-PythonExe', "`"$py`""
+        '-NoProfile', '-File', "`"$ps1`"", '-PythonExe', "`"$py`""
     ) -Wait
     if (Test-Path $log) {
         return (Get-Content $log -Encoding UTF8 | Select-Object -Last 6) -join "`r`n"

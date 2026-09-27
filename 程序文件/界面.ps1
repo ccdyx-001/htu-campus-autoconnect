@@ -262,8 +262,11 @@ function Complete-TaskStateAsync {
 
 function Invoke-TaskScript {
     param([switch]$Uninstall)
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
-                 '-File', "`"$taskPs1`"", '-PythonExe', "`"$pyExe`"")
+    # 注意：这里刻意不带执行策略参数、也不带窗口样式参数 ——
+    # 这两样叠在一起是杀毒软件的高危特征。本机自己的 .ps1 在默认
+    # RemoteSigned 策略下本来就能执行，所以策略参数是多余的；
+    # 提权（-Verb RunAs）必须保留，否则删/建计划任务会失败。
+    $argList = @('-NoProfile', '-File', "`"$taskPs1`"", '-PythonExe', "`"$pyExe`"")
     if ($Uninstall) { $argList += '-Uninstall' }
     Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -Wait
     if (Test-Path $installLog) { return (Get-Content $installLog -Encoding UTF8 | Select-Object -Last 6) -join "`r`n" }
@@ -306,7 +309,7 @@ function Save-Cred {
 
 # ---------------- 作者信息 ----------------
 
-$APP_VERSION = '1.1.1'
+$APP_VERSION = '1.3.0'
 $AUTHOR_NAME = '梅川逸夫'
 $AUTHOR_ID   = ''
 
@@ -710,6 +713,9 @@ function Update-State {
     elseif ($hasCred) { $lblCred.ForeColor = $clrOk }
     elseif ($script:Summary) { $lblCred.ForeColor = $clrWarn }
     else { $lblCred.ForeColor = $clrMuted }
+
+    # 托盘图标的悬停提示跟着一起刷新（用户就是靠它判断状态的）
+    if (Get-Command Update-TrayTip -ErrorAction SilentlyContinue) { Update-TrayTip }
 }
 
 # ---- 事件 ----
@@ -810,6 +816,11 @@ $btnInstall.Add_Click({
 
 $btnTest.Add_Click({
     Begin-Action $btnTest '正在测试…'
+    Invoke-ConnectionTest
+})
+
+# ---- 下面两个抽成函数：主界面按钮和托盘菜单共用同一套逻辑 ----
+function Invoke-ConnectionTest {
     Write-Log2 '开始连接测试…'
     [void](Start-PyAsync -PyArgs @($mainPy, '--force') -BusyText '正在测试连接' -TimeoutSec 60 -OnDone {
         param($out, $code)
@@ -824,10 +835,9 @@ $btnTest.Add_Click({
         Update-NetStateAsync
         Update-State
     })
-})
+}
 
-$btnStatus.Add_Click({
-    Begin-Action $btnStatus '检查中…'
+function Invoke-StatusCheck {
     Start-TaskStateAsync           # 计划任务改后台查，界面不卡
     Write-Log2 '---- 状态检查 ----'
     $user = $txtUser.Text.Trim()
@@ -844,6 +854,56 @@ $btnStatus.Add_Click({
     $script:NetState = $null
     Update-NetStateAsync
     Update-State
+}
+
+function Show-MainWindow {
+    # 从托盘把主窗口叫回来（双击图标 / 菜单【打开界面】都走这里）
+    try {
+        $form.ShowInTaskbar = $true
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        $form.Show()
+        $form.Activate()
+        $form.BringToFront()
+    } catch { }
+}
+
+function Hide-ToTray {
+    # 最小化 -> 缩到托盘（窗口缩掉、任务栏不显示，托盘图标留着，用户能看出进程还活着）
+    # ⚠ 踩坑：主窗口是用 ShowDialog() 显示的，对它调用 Hide() 会让模态消息循环直接退出
+    #   —— 结果就是"一最小化整个程序就没了、托盘图标也没了"（实测复现过）。
+    #   所以这里只能"缩到最小 + 从任务栏隐藏"，绝不能 Hide()。
+    try {
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+        $form.ShowInTaskbar = $false
+        if ($script:Tray -and -not $script:TrayExiting) {
+            $script:Tray.Visible = $true
+            $script:Tray.ShowBalloonTip(2500, '校园网自动连接',
+                '已缩到托盘（右下角），双击图标可以打开界面。', [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+        Write-Log2 '已缩到系统托盘（右下角图标还在）。双击图标可以重新打开界面。'
+    } catch { }
+}
+
+function Exit-App {
+    # 点 X / 托盘菜单【退出】：真正结束进程，并且保证托盘图标一起消失
+    $script:TrayExiting = $true
+    try {
+        if ($script:Tray) {
+            $script:Tray.Visible = $false
+            $script:Tray.ShowBalloonTip(3000, '校园网自动连接',
+                '程序已退出，右下角图标会消失。' + "`r`n" +
+                '开机自动连由计划任务负责，不受影响。', [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+    } catch { }
+    try { if ($script:Tray) { $script:Tray.Dispose() } } catch { }
+    $script:Tray = $null
+    try { $form.Close() } catch { }
+    try { [System.Windows.Forms.Application]::Exit() } catch { }
+}
+
+$btnStatus.Add_Click({
+    Begin-Action $btnStatus '检查中…'
+    Invoke-StatusCheck
 })
 
 $btnLog.Add_Click({
@@ -1024,4 +1084,110 @@ if ($LayoutCheck) {
     exit 0
 }
 
-[void]$form.ShowDialog()
+# ================= 系统托盘图标（v1.3.0 新增）=================
+# 用户需求："希望右下角有个状态栏图标，看我到底关了进程没有"
+#   · 进程活着就有图标；进程一退出图标立刻消失 —— 这就是"关没关"的判据
+#   · 双击图标 = 打开并激活主窗口
+#   · 右键菜单：打开界面 / 立即连接测试 / 查看状态 / 退出
+#   · 悬停提示跟随 Update-State 实时刷新
+#   · 关闭行为明确：点 X = 真正退出（并给一次气泡说明）；最小化 = 缩到托盘
+$script:Tray = $null
+$script:TrayExiting = $false
+$script:TrayTip = '校园网自动连接'
+
+function Get-TrayTipText {
+    $net = ''
+    $tsk = ''
+    try { $net = (Get-NetState).text } catch { }
+    try { $tsk = (Get-TaskState).text } catch { }
+    if (-not $net) { $net = '检测中' }
+    if (-not $tsk) { $tsk = '检测中' }
+    $tip = '校园网自动连接 v' + $APP_VERSION + ' ｜ 网络：' + $net + ' ｜ 自动连接：' + $tsk
+    # 托盘提示有长度上限（约 127 字符），超了会显示异常，这里截断
+    if ($tip.Length -gt 120) { $tip = $tip.Substring(0, 120) }
+    return $tip
+}
+
+function Update-TrayTip {
+    if (-not $script:Tray) { return }
+    try {
+        $tip = Get-TrayTipText
+        $script:TrayTip = $tip
+        $script:Tray.Text = $tip
+    } catch { }
+}
+
+try {
+    $script:Tray = New-Object System.Windows.Forms.NotifyIcon
+    $trayIconPath = Join-Path $root 'logo.ico'
+    if (Test-Path $trayIconPath) {
+        $script:Tray.Icon = New-Object System.Drawing.Icon($trayIconPath)
+    } else {
+        $script:Tray.Icon = [System.Drawing.SystemIcons]::Application
+    }
+    $script:Tray.Text = '校园网自动连接 v' + $APP_VERSION
+    $script:Tray.Visible = $true          # 进程活着 → 图标就在
+
+    $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $miOpen = $trayMenu.Items.Add('打开界面')
+    $miOpen.Add_Click({ Show-MainWindow })
+    $miTest = $trayMenu.Items.Add('立即连接测试')
+    $miTest.Add_Click({ Invoke-ConnectionTest })
+    $miStatus = $trayMenu.Items.Add('查看状态')
+    $miStatus.Add_Click({ Invoke-StatusCheck })
+    [void]$trayMenu.Items.Add('-')
+    $miExit = $trayMenu.Items.Add('退出')
+    $miExit.Add_Click({ Exit-App })
+    $script:Tray.ContextMenuStrip = $trayMenu
+
+    # 双击图标 = 显示并激活主窗口
+    $script:Tray.Add_DoubleClick({ Show-MainWindow })
+    # 单击也把窗口叫回来（很多人习惯单击；右键仍是菜单）
+    $script:Tray.Add_MouseClick({
+        param($sender, $e)
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Show-MainWindow }
+    })
+} catch {
+    # 托盘建不起来也不能让界面挂掉
+    Write-Log2 ('托盘图标创建失败（不影响其它功能）：' + $_.Exception.Message)
+    $script:Tray = $null
+}
+
+# 最小化 = 缩到托盘（窗口隐藏、图标保留）
+$form.Add_Resize({
+    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+        Hide-ToTray
+    }
+})
+
+# 点右上角 X = 真正退出进程（退出后托盘图标消失），并给一次说明
+$form.Add_FormClosing({
+    param($sender, $e)
+    if ($script:TrayExiting) { return }
+    $script:TrayExiting = $true
+    try {
+        if ($script:Tray) {
+            $script:Tray.Visible = $false
+            $script:Tray.ShowBalloonTip(3000, '校园网自动连接',
+                '程序已退出，右下角图标会消失。' + "`r`n" +
+                '开机自动连由计划任务负责，不受影响（想连上网不受影响）。',
+                [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+    } catch { }
+    try { if ($script:Tray) { $script:Tray.Dispose() } } catch { }
+    $script:Tray = $null
+    Write-Log2 '已退出（托盘图标已移除）。开机自动连由计划任务负责，不受影响。'
+})
+
+try {
+    # ⚠ 这里从 ShowDialog() 改成 Application::Run()：
+    #   ShowDialog 是"模态对话框"循环，对它调 Hide() 或者缩到最小 + 隐藏任务栏按钮，
+    #   模态循环会直接退出 —— 表现为"一最小化整个程序就没了"（实测复现过）。
+    #   Application::Run 是标准消息循环，托盘程序必须用它，缩到托盘后进程能继续活着。
+    #   界面本身没有任何"对话框语义"的用法，换成 Run 对其它功能没有影响。
+    [System.Windows.Forms.Application]::Run($form)
+} finally {
+    # 兜底：无论怎么退出，都不留"幽灵托盘图标"
+    try { if ($script:Tray) { $script:Tray.Visible = $false; $script:Tray.Dispose() } } catch { }
+    $script:Tray = $null
+}

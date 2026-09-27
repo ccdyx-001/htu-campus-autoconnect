@@ -37,7 +37,9 @@ function Test-Admin {
 # ---------- 自提权 ----------
 if (-not (Test-Admin)) {
     Write-Host "需要管理员权限，正在请求提权（请在弹窗中点击 [是]）..." -ForegroundColor Yellow
-    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"",
+    # 刻意不带执行策略参数、也不带窗口样式参数 —— 这两样叠起来是杀毒软件的高危特征。
+    # 本机自己的 .ps1 在默认 RemoteSigned 策略下本来就能执行。
+    $argList = @("-NoProfile", "-File", "`"$PSCommandPath`"",
                  "-TaskName", "`"$TaskName`"")
     if ($PythonExe) { $argList += @("-PythonExe", "`"$PythonExe`"") }
     if ($Uninstall) { $argList += "-Uninstall" }
