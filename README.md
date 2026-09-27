@@ -24,12 +24,12 @@
 - **免安装运行库**：内置 Python 3.12，电脑上不需要装 Python、不需要 pip
 - **兼容代理软件**：Clash / Watt Toolkit 等开着也能用（校园网请求强制直连）
 - **校外不卡界面**：连着手机热点时 2 秒内判断"不在校园网"，界面全程可操作
-- **隐私**：账号密码只存在你自己电脑上（`程序文件\credentials.env`），不上传任何服务器
+- **隐私**：账号密码只存在你自己电脑上（安装后位于 `%LOCALAPPDATA%\HTUAutoConnect\credentials.env`），不上传任何服务器
 - **纯标准库**：100% Python 标准库实现，源码可读可改
 
 ## 快速开始
 
-1. 到 [Releases](https://github.com/ccdyx-001/htu-campus-autoconnect/releases/latest) 下载 `校园网自动连接_免费开源版.zip`，解压到任意位置（桌面也行）
+1. 到 [Releases](https://github.com/ccdyx-001/htu-campus-autoconnect/releases/latest) 下载 `htu-campus-autoconnect_v1.0.0.zip`（发布包用英文名，避免 GitHub 截断中文文件名），解压到任意位置（桌面也行）
 2. 双击 **`点我启动.bat`**
 3. 在窗口里填：**学号** → **上网密码** → 点【保存并安装】
 4. 弹出管理员权限确认框时点 **【是】**（注册开机自启任务需要）
@@ -40,7 +40,7 @@
 ## 目录结构
 
 ```
-校园网自动连接_免费开源版\
+校园网自动连接_v1.0.0\      ← 解压后得到的文件夹
 ├── 点我启动.bat          ← 双击这个
 ├── 卸载.bat
 ├── 使用说明.txt
