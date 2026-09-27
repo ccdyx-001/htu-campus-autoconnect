@@ -1,0 +1,28 @@
+# ---- 个人数据：绝对不能上传 ----
+credentials.env
+credentials.dat
+.user
+license.key
+.license_state
+.netmacs.json
+
+# ---- 运行日志 ----
+*.log
+install_log.txt
+.last_heartbeat
+
+# ---- 作者专用（注册码私钥等）----
+签发私钥.xml
+签发记录.csv
+批量码_*.txt
+
+# ---- 内置运行库（21MB，太大，走 Release 附件）----
+runtime/
+
+# ---- 系统 / 编辑器杂项 ----
+__pycache__/
+*.pyc
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
