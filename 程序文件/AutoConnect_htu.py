@@ -62,7 +62,7 @@ PORTAL_PROBES = [
 ]
 
 # ---- 版本号（改程序时记得同步更新 CHANGELOG.md）----
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CRED_FILE = os.path.join(SCRIPT_DIR, "credentials.env")        # v1.0.0 的明文文件（现在只用于自动升级）

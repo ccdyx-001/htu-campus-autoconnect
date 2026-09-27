@@ -45,3 +45,56 @@ Author: CCDYX <caiwenchao2024@outlook.com>
 Date:   Sun Sep 27 10:45:52 2026 +0800
 
     限制上传规则
+[33mcommit 803f2c4658a7ffa818adb7935e197cdfca855d89[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;33mtag: [m[1;33mv1.1.0[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 16:21:38 2026 +0800
+
+    v1.1.0：账号密码改用 Windows DPAPI 加密（旧明文自动迁移）；卸载可选保留/删除账号并修漏删安装目录账号；修说明书发错版本、界面误显示未保存；打包新增编码体检
+
+[33mcommit d0e2c6d93084f65d603eebd72eb41e7abd2c2161[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 15:38:39 2026 +0800
+
+    发布包改用英文文件名（避免 GitHub 截断中文），README 同步
+
+[33mcommit 15e6be30d02ccfaafeb74e65ac63a60d8bb1ae08[m[33m ([m[1;33mtag: [m[1;33mv1.0.0[m[33m)[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 15:12:42 2026 +0800
+
+    v1.0.0：控制面板登记（版本号/发布者/大小）+ 开始菜单快捷方式；卸载程序加固（--from-panel 可交互选择保留或删除、逐步容错、卸载日志）；补 FAQ
+
+[33mcommit 4dfbf561233a1c854e954cd900a590a0fed15e16[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 14:44:58 2026 +0800
+
+    升级到完整版：图形界面 + 内置运行库（免装 Python）+ 桌面快捷方式 + 一键卸载；README 增加数据与隐私说明
+
+[33mcommit 8c7c857ea48b1e4a2ad6a9f52574ddfd6db632fd[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 14:19:33 2026 +0800
+
+    README：补充联系方式（Issue 优先，邮箱备用）
+
+[33mcommit 7f4b7920e0eeb676f83a352fabf9c5d11c70c409[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 14:06:08 2026 +0800
+
+    改为完全开源（MIT）；README 增加反馈渠道，新增 Bug 报告模板
+
+[33mcommit f449b59e884f3740e16ef3f20cb0a86318eddc80[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 12:23:54 2026 +0800
+
+    添加 README 和 LICENSE（MIT）
+
+[33mcommit 6f8bd68c1da2f83031eb9d285766243a2c69b3d2[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 12:01:16 2026 +0800
+
+    初始版本：校园网自动连接工具（自动认证 + 断网重连 + 计划任务）
+
+[33mcommit db2ea080cc1a1d153d9fca828dce2a9c26ed02ba[m
+Author: CCDYX <caiwenchao2024@outlook.com>
+Date:   Sun Sep 27 10:45:52 2026 +0800
+
+    限制上传规则

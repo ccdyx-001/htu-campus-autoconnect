@@ -83,6 +83,29 @@ function Set-UiBusy {
     }
     try { $form.UseWaitCursor = $isBusy } catch { }
     if ($Busy -and $Text) { Write-Log2 ('……' + $Text + '（界面可以正常操作，完成后自动显示结果）') }
+    if (-not $isBusy) { End-Actions }      # 忙完了：按钮文字恢复原样
+}
+
+# ---------------- 点击反馈（点下去立刻有反应）----------------
+# 以前：点了按钮要等后台进程返回才看到变化，容易让人以为"没反应"又点一次。
+# 现在：点击瞬间按钮文字变成"正在…"并禁用，同时立刻重绘。
+$script:BtnDefaults = @{}
+
+function Begin-Action {
+    param($Btn, [string]$Text)
+    if (-not $Btn) { return }
+    if (-not $script:BtnDefaults.ContainsKey($Btn)) { $script:BtnDefaults[$Btn] = $Btn.Text }
+    if ($Text) { $Btn.Text = $Text }
+    $Btn.Enabled = $false
+    try { $form.UseWaitCursor = $true } catch { }
+    try { $form.Refresh() } catch { }
+}
+
+function End-Actions {
+    foreach ($b in @($script:BtnDefaults.Keys)) {
+        try { $b.Text = $script:BtnDefaults[$b]; $b.Enabled = $true } catch { }
+    }
+    try { $form.UseWaitCursor = $false } catch { }
 }
 
 function Start-PyAsync {
@@ -126,6 +149,8 @@ $script:NetState  = $null
 $script:NetJob    = $false
 $script:TaskState = $null
 $script:TaskTime  = [datetime]::MinValue
+$script:TaskPs    = $null      # 后台计划任务查询的运行空间
+$script:TaskPsHandle = $null
 
 function Get-NetState {
     if ($script:NetState) { return $script:NetState }
@@ -180,18 +205,59 @@ function Update-NetStateAsync {
 }
 
 function Get-TaskState {
-    # 计划任务查询有几十毫秒开销，缓存 5 秒，避免每次刷新都查
-    if ($script:TaskState -and ((Get-Date) - $script:TaskTime).TotalSeconds -lt 5) {
-        return $script:TaskState
+    # 只读缓存 —— 真正查询在后台跑（见 Start-TaskStateAsync）
+    if ($script:TaskState) { return $script:TaskState }
+    return @{ ok = $null; text = '检测中…' }
+}
+
+function Start-TaskStateAsync {
+    param([switch]$Force)
+    # 为什么必须放后台：Get-ScheduledTask 第一次调用要载入 ScheduledTasks 模块，
+    # 实测约 900 ms。以前它是在界面线程里同步查的，导致窗口出现后大约 1 秒点不动。
+    # 这里用 PowerShell 运行空间在后台查，界面只负责取结果。
+    if ($script:TaskPs) { return }                                  # 已经在查了
+    if (-not $Force -and $script:TaskState -and ((Get-Date) - $script:TaskTime).TotalSeconds -lt 5) { return }
+    try {
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({
+            param($name)
+            $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            if (-not $t) { return 'NONE' }
+            $i = Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue
+            return ('OK|{0}|{1}' -f $t.State, $i.LastTaskResult)
+        }).AddArgument($TaskName)
+        $script:TaskPs = $ps
+        $script:TaskPsHandle = $ps.BeginInvoke()
+        $script:PyTimer.Start()
+    } catch {
+        $script:TaskPs = $null; $script:TaskPsHandle = $null
     }
-    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $t) { $script:TaskState = @{ ok = $false; text = '未安装' } }
-    else {
-        $i = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
-        $script:TaskState = @{ ok = $true; text = ('已安装（{0} / 上次结果 {1}）' -f $t.State, $i.LastTaskResult) }
+}
+
+function Complete-TaskStateAsync {
+    # 由后台任务定时器调用：查完了就把结果收进缓存，并刷新状态栏
+    if (-not $script:TaskPs -or -not $script:TaskPsHandle) { return }
+    if (-not $script:TaskPsHandle.IsCompleted) { return }
+    try {
+        $res = @($script:TaskPs.EndInvoke($script:TaskPsHandle))
+        $line = ''
+        foreach ($r in $res) { if ("$r".Trim()) { $line = "$r".Trim() } }
+        if ($line -eq 'NONE') {
+            $script:TaskState = @{ ok = $false; text = '未安装' }
+        } elseif ($line -like 'OK|*') {
+            $p = $line -split '\|'
+            $script:TaskState = @{ ok = $true; text = ('已安装（{0} / 上次结果 {1}）' -f $p[1], $p[2]) }
+        } else {
+            $script:TaskState = @{ ok = $null; text = '检测中…' }
+        }
+        $script:TaskTime = Get-Date
+    } catch {
+        $script:TaskState = @{ ok = $null; text = '检测失败（可点【查看状态】重试）' }
+    } finally {
+        try { $script:TaskPs.Dispose() } catch { }
+        $script:TaskPs = $null; $script:TaskPsHandle = $null
+        Update-State
     }
-    $script:TaskTime = Get-Date
-    return $script:TaskState
 }
 
 function Invoke-TaskScript {
@@ -240,7 +306,7 @@ function Save-Cred {
 
 # ---------------- 作者信息 ----------------
 
-$APP_VERSION = '1.1.0'
+$APP_VERSION = '1.1.1'
 $AUTHOR_NAME = '梅川逸夫'
 $AUTHOR_ID   = ''
 
@@ -285,8 +351,14 @@ if ($Check) {
     } else {
         Write-Host "账号状态  : （--info 读取失败）" -ForegroundColor Yellow
     }
-    $tsk = Get-TaskState
-    Write-Host ("任务状态  : {0}" -f $tsk.text)
+    # 自检模式直接同步查（这里不在乎那几百毫秒，但要拿到真实结果）
+    $tObj = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $tObj) {
+        Write-Host "任务状态  : 未安装"
+    } else {
+        $tInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+        Write-Host ("任务状态  : 已安装（{0} / 上次结果 {1}）" -f $tObj.State, $tInfo.LastTaskResult)
+    }
     Write-Host "界面自检完成"
     exit 0
 }
@@ -301,7 +373,13 @@ Add-Type -AssemblyName System.Drawing
 $script:PyTimer = New-Object System.Windows.Forms.Timer
 $script:PyTimer.Interval = 200
 $script:PyTimer.Add_Tick({
-    if ($script:PyJobs.Count -eq 0) { $script:PyTimer.Stop(); return }
+    # 顺便收后台的"计划任务查询"结果（它不占界面线程）
+    if ($script:TaskPs) { Complete-TaskStateAsync }
+
+    if ($script:PyJobs.Count -eq 0) {
+        if (-not $script:TaskPs) { $script:PyTimer.Stop() }
+        return
+    }
     foreach ($id in @($script:PyJobs.Keys)) {
         $job = $script:PyJobs[$id]
         if (-not $job) { continue }
@@ -334,17 +412,33 @@ $script:PyTimer.Add_Tick({
     }
 })
 
-$fontTitle = New-Object System.Drawing.Font('Microsoft YaHei UI', 13, [System.Drawing.FontStyle]::Bold)
+$fontTitle = New-Object System.Drawing.Font('Microsoft YaHei UI', 14, [System.Drawing.FontStyle]::Bold)
 $fontNormal = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+$fontSmall = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.25)
 $fontMono = New-Object System.Drawing.Font('Consolas', 9)
+$fontCard = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+
+# ---- 统一配色（改这里就等于换整套皮肤）----
+$clrBg     = [System.Drawing.Color]::FromArgb(245, 246, 248)   # 窗体底色：浅灰
+$clrCard   = [System.Drawing.Color]::White                     # 卡片底色
+$clrBorder = [System.Drawing.Color]::FromArgb(216, 220, 226)   # 卡片描边
+$clrText   = [System.Drawing.Color]::FromArgb(32, 36, 42)      # 主文字
+$clrMuted  = [System.Drawing.Color]::FromArgb(122, 128, 138)   # 次要文字
+$clrAccent = [System.Drawing.Color]::FromArgb(37, 99, 235)     # 主按钮：蓝
+$clrAccentHover = [System.Drawing.Color]::FromArgb(29, 78, 216)
+$clrBtnHover = [System.Drawing.Color]::FromArgb(238, 242, 248)
+$clrOk     = [System.Drawing.Color]::FromArgb(22, 140, 74)     # 绿：正常
+$clrWarn   = [System.Drawing.Color]::FromArgb(200, 90, 10)     # 橙：待处理
+$clrBad    = [System.Drawing.Color]::FromArgb(190, 40, 40)     # 红：异常/警告
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '河南师范大学 校园网自动连接 v' + $APP_VERSION
-$form.Size = New-Object System.Drawing.Size(580, 648)
+$form.Size = New-Object System.Drawing.Size(580, 660)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.Font = $fontNormal
+$form.BackColor = $clrBg
 
 # ---- 窗口/任务栏图标（logo.ico 存在才设置，缺失不影响使用）----
 $logoIco = Join-Path $root 'logo.ico'
@@ -356,9 +450,10 @@ if (Test-Path $logoIco) {
 # ---- 左上角个人 Logo ----
 if (Test-Path $logoPng) {
     $picLogo = New-Object System.Windows.Forms.PictureBox
-    $picLogo.Location = New-Object System.Drawing.Point(20, 12)
-    $picLogo.Size = New-Object System.Drawing.Size(54, 54)
+    $picLogo.Location = New-Object System.Drawing.Point(22, 18)
+    $picLogo.Size = New-Object System.Drawing.Size(44, 44)
     $picLogo.SizeMode = 'Zoom'
+    $picLogo.BackColor = [System.Drawing.Color]::Transparent
     try { $picLogo.Image = [System.Drawing.Image]::FromFile($logoPng) } catch { }
     $form.Controls.Add($picLogo)
 }
@@ -366,25 +461,31 @@ if (Test-Path $logoPng) {
 $lblTitle = New-Object System.Windows.Forms.Label
 $lblTitle.Text = '校园网自动连接'
 $lblTitle.Font = $fontTitle
-$lblTitle.Location = New-Object System.Drawing.Point(88, 14)
-$lblTitle.Size = New-Object System.Drawing.Size(300, 30)
+$lblTitle.ForeColor = $clrText
+$lblTitle.Location = New-Object System.Drawing.Point(78, 20)
+$lblTitle.Size = New-Object System.Drawing.Size(280, 30)
+$lblTitle.BackColor = [System.Drawing.Color]::Transparent
 $form.Controls.Add($lblTitle)
 
 $lblSub = New-Object System.Windows.Forms.Label
 $lblSub.Text = '开机自动认证 · 断网自动重连 · 后台静默运行'
-$lblSub.ForeColor = [System.Drawing.Color]::Gray
-$lblSub.Location = New-Object System.Drawing.Point(90, 46)
-$lblSub.Size = New-Object System.Drawing.Size(340, 20)
+$lblSub.Font = $fontSmall
+$lblSub.ForeColor = $clrMuted
+$lblSub.Location = New-Object System.Drawing.Point(80, 50)
+$lblSub.Size = New-Object System.Drawing.Size(300, 18)
+$lblSub.BackColor = [System.Drawing.Color]::Transparent
 $form.Controls.Add($lblSub)
 
-# ---- 右上角：作者卡片（头像 + 昵称 + 学号，点一下看关于）----
+# ---- 右上角：作者（头像 + 昵称，点一下看关于）----
 $tipAbout = New-Object System.Windows.Forms.ToolTip
 $lblAuthor = New-Object System.Windows.Forms.Label
 $lblAuthor.Text = $AUTHOR_NAME
-$lblAuthor.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10, [System.Drawing.FontStyle]::Bold)
-$lblAuthor.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-$lblAuthor.Location = New-Object System.Drawing.Point(480, 16)
-$lblAuthor.Size = New-Object System.Drawing.Size(80, 22)
+$lblAuthor.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Bold)
+$lblAuthor.ForeColor = $clrText
+$lblAuthor.Location = New-Object System.Drawing.Point(392, 22)
+$lblAuthor.Size = New-Object System.Drawing.Size(100, 18)
+$lblAuthor.TextAlign = 'MiddleRight'
+$lblAuthor.BackColor = [System.Drawing.Color]::Transparent
 $lblAuthor.Cursor = 'Hand'
 $lblAuthor.Add_Click({ Show-About })
 $tipAbout.SetToolTip($lblAuthor, '作者：梅川逸夫 —— 点一下看关于')
@@ -392,10 +493,12 @@ $form.Controls.Add($lblAuthor)
 
 $lblAuthorId = New-Object System.Windows.Forms.Label
 $lblAuthorId.Text = '免费开源'
-$lblAuthorId.Font = New-Object System.Drawing.Font('Consolas', 9)
-$lblAuthorId.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
-$lblAuthorId.Location = New-Object System.Drawing.Point(481, 38)
-$lblAuthorId.Size = New-Object System.Drawing.Size(80, 18)
+$lblAuthorId.Font = $fontSmall
+$lblAuthorId.ForeColor = $clrMuted
+$lblAuthorId.Location = New-Object System.Drawing.Point(392, 42)
+$lblAuthorId.Size = New-Object System.Drawing.Size(100, 16)
+$lblAuthorId.TextAlign = 'MiddleRight'
+$lblAuthorId.BackColor = [System.Drawing.Color]::Transparent
 $lblAuthorId.Cursor = 'Hand'
 $lblAuthorId.Add_Click({ Show-About })
 $tipAbout.SetToolTip($lblAuthorId, '点一下看关于')
@@ -403,9 +506,10 @@ $form.Controls.Add($lblAuthorId)
 
 if (Test-Path $logoPng) {
     $picFace = New-Object System.Windows.Forms.PictureBox
-    $picFace.Location = New-Object System.Drawing.Point(430, 14)
-    $picFace.Size = New-Object System.Drawing.Size(46, 46)
+    $picFace.Location = New-Object System.Drawing.Point(502, 18)
+    $picFace.Size = New-Object System.Drawing.Size(40, 40)
     $picFace.SizeMode = 'Zoom'
+    $picFace.BackColor = [System.Drawing.Color]::Transparent
     $picFace.Cursor = 'Hand'
     try { $picFace.Image = [System.Drawing.Image]::FromFile($logoPng) } catch { }
     $picFace.Add_Click({ Show-About })
@@ -413,92 +517,158 @@ if (Test-Path $logoPng) {
     $form.Controls.Add($picFace)
 }
 
+# ---- 输入区（白卡片，两行：学号 / 密码）----
+$cardInput = New-Object System.Windows.Forms.Panel
+$cardInput.Location = New-Object System.Drawing.Point(20, 84)
+$cardInput.Size = New-Object System.Drawing.Size(524, 112)
+$cardInput.BackColor = $clrCard
+$cardInput.BorderStyle = 'FixedSingle'
+$form.Controls.Add($cardInput)
+
 $lblUser = New-Object System.Windows.Forms.Label
-$lblUser.Text = '学号：'
-$lblUser.Location = New-Object System.Drawing.Point(22, 78)
-$lblUser.Size = New-Object System.Drawing.Size(60, 22)
-$form.Controls.Add($lblUser)
+$lblUser.Text = '学号'
+$lblUser.Font = $fontCard
+$lblUser.ForeColor = $clrMuted
+$lblUser.Location = New-Object System.Drawing.Point(16, 18)
+$lblUser.Size = New-Object System.Drawing.Size(52, 22)
+$cardInput.Controls.Add($lblUser)
 
 $txtUser = New-Object System.Windows.Forms.TextBox
-$txtUser.Location = New-Object System.Drawing.Point(84, 75)
-$txtUser.Size = New-Object System.Drawing.Size(300, 24)
-$form.Controls.Add($txtUser)
+$txtUser.Location = New-Object System.Drawing.Point(72, 15)
+$txtUser.Size = New-Object System.Drawing.Size(336, 26)
+$txtUser.Font = $fontCard
+$cardInput.Controls.Add($txtUser)
 
 $lblPwd = New-Object System.Windows.Forms.Label
-$lblPwd.Text = '密码：'
-$lblPwd.Location = New-Object System.Drawing.Point(22, 112)
-$lblPwd.Size = New-Object System.Drawing.Size(60, 22)
-$form.Controls.Add($lblPwd)
+$lblPwd.Text = '密码'
+$lblPwd.Font = $fontCard
+$lblPwd.ForeColor = $clrMuted
+$lblPwd.Location = New-Object System.Drawing.Point(16, 56)
+$lblPwd.Size = New-Object System.Drawing.Size(52, 22)
+$cardInput.Controls.Add($lblPwd)
 
 $txtPwd = New-Object System.Windows.Forms.TextBox
-$txtPwd.Location = New-Object System.Drawing.Point(84, 109)
-$txtPwd.Size = New-Object System.Drawing.Size(300, 24)
+$txtPwd.Location = New-Object System.Drawing.Point(72, 53)
+$txtPwd.Size = New-Object System.Drawing.Size(336, 26)
+$txtPwd.Font = $fontCard
 $txtPwd.UseSystemPasswordChar = $true
-$form.Controls.Add($txtPwd)
+$cardInput.Controls.Add($txtPwd)
 
 $chkShow = New-Object System.Windows.Forms.CheckBox
 $chkShow.Text = '显示密码'
-$chkShow.Location = New-Object System.Drawing.Point(394, 110)
-$chkShow.Size = New-Object System.Drawing.Size(110, 24)
+$chkShow.ForeColor = $clrMuted
+$chkShow.Location = New-Object System.Drawing.Point(418, 54)
+$chkShow.Size = New-Object System.Drawing.Size(96, 24)
+$chkShow.Cursor = 'Hand'
 $chkShow.Add_Click({ $txtPwd.UseSystemPasswordChar = -not $chkShow.Checked })
-$form.Controls.Add($chkShow)
+$cardInput.Controls.Add($chkShow)
 
+# ---- 主操作：一个大按钮（一眼看到该点哪）----
 $btnInstall = New-Object System.Windows.Forms.Button
 $btnInstall.Text = '保存并安装'
-$btnInstall.Location = New-Object System.Drawing.Point(22, 150)
-$btnInstall.Size = New-Object System.Drawing.Size(150, 34)
+$btnInstall.Location = New-Object System.Drawing.Point(20, 208)
+$btnInstall.Size = New-Object System.Drawing.Size(524, 40)
+$btnInstall.FlatStyle = 'Flat'
+$btnInstall.FlatAppearance.BorderSize = 0
+$btnInstall.FlatAppearance.MouseOverBackColor = $clrAccentHover
+$btnInstall.BackColor = $clrAccent
+$btnInstall.ForeColor = [System.Drawing.Color]::White
+$btnInstall.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold)
+$btnInstall.Cursor = 'Hand'
 $form.Controls.Add($btnInstall)
 
-$btnTest = New-Object System.Windows.Forms.Button
-$btnTest.Text = '立即连接测试'
-$btnTest.Location = New-Object System.Drawing.Point(182, 182)
-$btnTest.Size = New-Object System.Drawing.Size(150, 34)
-$form.Controls.Add($btnTest)
+# ---- 次要操作：一行四个等宽按钮 ----
+function New-SubButton {
+    param([string]$Text, [int]$X, [int]$W)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $Text
+    $b.Location = New-Object System.Drawing.Point($X, 258)
+    $b.Size = New-Object System.Drawing.Size($W, 34)
+    $b.FlatStyle = 'Flat'
+    $b.FlatAppearance.BorderColor = $clrBorder
+    $b.FlatAppearance.MouseOverBackColor = $clrBtnHover
+    $b.BackColor = $clrCard
+    $b.ForeColor = $clrText
+    $b.Cursor = 'Hand'
+    $form.Controls.Add($b)
+    return $b
+}
+$btnTest      = New-SubButton '立即连接测试' 20 170
+$btnStatus    = New-SubButton '查看状态'     198 112
+$btnLog       = New-SubButton '打开日志'     318 112
+$btnUninstall = New-SubButton '卸载'         438 106
 
-$btnStatus = New-Object System.Windows.Forms.Button
-$btnStatus.Text = '查看状态'
-$btnStatus.Location = New-Object System.Drawing.Point(342, 182)
-$btnStatus.Size = New-Object System.Drawing.Size(100, 34)
-$form.Controls.Add($btnStatus)
 
-$btnLog = New-Object System.Windows.Forms.Button
-$btnLog.Text = '打开日志'
-$btnLog.Location = New-Object System.Drawing.Point(452, 182)
-$btnLog.Size = New-Object System.Drawing.Size(100, 34)
-$form.Controls.Add($btnLog)
+# ---- 状态卡片（三行，各带颜色圆点：网络 / 自动连接 / 账号）----
+$cardState = New-Object System.Windows.Forms.Panel
+$cardState.Location = New-Object System.Drawing.Point(20, 306)
+$cardState.Size = New-Object System.Drawing.Size(524, 92)
+$cardState.BackColor = $clrCard
+$cardState.BorderStyle = 'FixedSingle'
+$form.Controls.Add($cardState)
 
-$btnUninstall = New-Object System.Windows.Forms.Button
-$btnUninstall.Text = '卸载'
-$btnUninstall.Location = New-Object System.Drawing.Point(22, 224)
-$btnUninstall.Size = New-Object System.Drawing.Size(118, 28)
-$form.Controls.Add($btnUninstall)
+$lblNet = New-Object System.Windows.Forms.Label
+$lblNet.Text = '● 网络：检测中…'
+$lblNet.Font = $fontCard
+$lblNet.ForeColor = $clrMuted
+$lblNet.Location = New-Object System.Drawing.Point(18, 14)
+$lblNet.Size = New-Object System.Drawing.Size(488, 22)
+$cardState.Controls.Add($lblNet)
 
+$lblTask = New-Object System.Windows.Forms.Label
+$lblTask.Text = '● 自动连接：检测中…'
+$lblTask.Font = $fontCard
+$lblTask.ForeColor = $clrMuted
+$lblTask.Location = New-Object System.Drawing.Point(18, 40)
+$lblTask.Size = New-Object System.Drawing.Size(488, 22)
+$cardState.Controls.Add($lblTask)
+
+$lblCred = New-Object System.Windows.Forms.Label
+$lblCred.Text = '● 账号：检测中…'
+$lblCred.Font = $fontCard
+$lblCred.ForeColor = $clrMuted
+$lblCred.Location = New-Object System.Drawing.Point(18, 66)
+$lblCred.Size = New-Object System.Drawing.Size(488, 22)
+$cardState.Controls.Add($lblCred)
+
+# ---- 运行日志 ----
+$lblLogTitle = New-Object System.Windows.Forms.Label
+$lblLogTitle.Text = '运行日志'
+$lblLogTitle.Font = $fontNormal
+$lblLogTitle.ForeColor = $clrMuted
+$lblLogTitle.Location = New-Object System.Drawing.Point(20, 408)
+$lblLogTitle.Size = New-Object System.Drawing.Size(200, 18)
+$form.Controls.Add($lblLogTitle)
 
 $txtOut = New-Object System.Windows.Forms.TextBox
-$txtOut.Location = New-Object System.Drawing.Point(22, 262)
-$txtOut.Size = New-Object System.Drawing.Size(530, 226)
+$txtOut.Location = New-Object System.Drawing.Point(20, 428)
+$txtOut.Size = New-Object System.Drawing.Size(524, 152)
 $txtOut.Multiline = $true
 $txtOut.ReadOnly = $true
 $txtOut.ScrollBars = 'Vertical'
-$txtOut.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+$txtOut.BackColor = $clrCard
+$txtOut.ForeColor = $clrText
+$txtOut.BorderStyle = 'FixedSingle'
 $txtOut.Font = $fontMono
 $form.Controls.Add($txtOut)
 
-$lblState = New-Object System.Windows.Forms.Label
-$lblState.Text = '正在检测…'
-$lblState.Location = New-Object System.Drawing.Point(22, 496)
-$lblState.Size = New-Object System.Drawing.Size(530, 44)
-$form.Controls.Add($lblState)
-$lblState.BringToFront()
-
-# ---- 底部：本机指纹 + 一键复制（按钮紧贴内容，方便操作）----
+# ---- 页脚 ----
 $lblFp = New-Object System.Windows.Forms.Label
-$lblFp.Text = '免费开源版 · 学号密码只存本机'
-$lblFp.Location = New-Object System.Drawing.Point(22, 548)
-$lblFp.Size = New-Object System.Drawing.Size(326, 26)
-$lblFp.Font = $fontNormal
+$lblFp.Text = '免费开源版 · 学号密码只存本机（Windows 加密）'
+$lblFp.Location = New-Object System.Drawing.Point(20, 590)
+$lblFp.Size = New-Object System.Drawing.Size(400, 18)
+$lblFp.Font = $fontSmall
+$lblFp.ForeColor = $clrMuted
 $form.Controls.Add($lblFp)
-$lblFp.BringToFront()
+
+$lblVer = New-Object System.Windows.Forms.Label
+$lblVer.Text = 'v' + $APP_VERSION
+$lblVer.Location = New-Object System.Drawing.Point(420, 590)
+$lblVer.Size = New-Object System.Drawing.Size(124, 18)
+$lblVer.Font = $fontSmall
+$lblVer.ForeColor = $clrMuted
+$lblVer.TextAlign = 'MiddleRight'
+$form.Controls.Add($lblVer)
 
 function Write-Log2 {
     param([string]$Msg)
@@ -516,6 +686,7 @@ function Write-Log2 {
 function Update-State {
     # 只读缓存，不启动任何进程 —— 所以点按钮、切换状态都是"瞬间"的
     $net = Get-NetState
+    Start-TaskStateAsync          # 需要时在后台刷新（已缓存则立刻返回）
     $tsk = Get-TaskState
     $hasCred = [bool]($script:Summary -and $script:Summary.has_cred)
     $credState = [string]$(if ($script:Summary) { $script:Summary.cred_state } else { '' })
@@ -528,14 +699,17 @@ function Update-State {
         $credText = '账号文件解不开，请重新填写学号密码并保存'
     }
 
-    $l1 = '网络：{0}      自动连接：{1}' -f $net.text, $tsk.text
-    $l2 = '账号：{0}' -f $credText
-    $lblState.Text = $l1 + "`r`n" + $l2
+    $lblNet.Text  = '● 网络：' + $net.text
+    $lblTask.Text = '● 自动连接：' + $tsk.text
+    $lblCred.Text = '● 账号：' + $credText
 
-    if ($credState -eq 'undecryptable') { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(190, 30, 30) }
-    elseif ($hasCred) { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(0, 110, 0) }
-    elseif ($script:Summary) { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(190, 60, 0) }
-    else { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60) }
+    # 每行单独上色：绿=正常 / 橙=要注意 / 红=有问题 / 灰=还在检测
+    $lblNet.ForeColor  = if ($net.ok -eq $true) { $clrOk } elseif ($net.ok -eq $false) { $clrWarn } else { $clrMuted }
+    $lblTask.ForeColor = if ($tsk.ok -eq $true) { $clrOk } elseif ($tsk.ok -eq $false) { $clrWarn } else { $clrMuted }
+    if ($credState -eq 'undecryptable') { $lblCred.ForeColor = $clrBad }
+    elseif ($hasCred) { $lblCred.ForeColor = $clrOk }
+    elseif ($script:Summary) { $lblCred.ForeColor = $clrWarn }
+    else { $lblCred.ForeColor = $clrMuted }
 }
 
 # ---- 事件 ----
@@ -588,8 +762,8 @@ function Complete-Install {
         } catch { }
     }
 
-    $tsk = Get-TaskState
-    Write-Log2 ('计划任务：' + $tsk.text)
+    Start-TaskStateAsync -Force
+    Write-Log2 '计划任务状态正在后台刷新…'
     Write-Log2 '安装完成 ✅'
     Update-State
 
@@ -603,12 +777,14 @@ function Complete-Install {
 }
 
 $btnInstall.Add_Click({
+    Begin-Action $btnInstall '正在保存…'
     $user = $txtUser.Text.Trim()
     $pwd = $txtPwd.Text
-    if (-not $user) { [System.Windows.Forms.MessageBox]::Show('请输入学号', '提示'); return }
-    if (-not $pwd) { [System.Windows.Forms.MessageBox]::Show('请输入上网密码', '提示'); return }
+    if (-not $user) { End-Actions; [System.Windows.Forms.MessageBox]::Show('请输入学号', '提示'); return }
+    if (-not $pwd) { End-Actions; [System.Windows.Forms.MessageBox]::Show('请输入上网密码', '提示'); return }
 
     if (-not (Save-Cred -User $user -Password $pwd)) {
+        End-Actions
         [System.Windows.Forms.MessageBox]::Show(
             "账号没能保存到本机，请看日志窗口里的原因。`r`n`r`n" +
             "常见原因：磁盘只读 / 杀毒软件拦截写入 / 程序目录被系统保护。",
@@ -633,6 +809,7 @@ $btnInstall.Add_Click({
 })
 
 $btnTest.Add_Click({
+    Begin-Action $btnTest '正在测试…'
     Write-Log2 '开始连接测试…'
     [void](Start-PyAsync -PyArgs @($mainPy, '--force') -BusyText '正在测试连接' -TimeoutSec 60 -OnDone {
         param($out, $code)
@@ -650,6 +827,8 @@ $btnTest.Add_Click({
 })
 
 $btnStatus.Add_Click({
+    Begin-Action $btnStatus '检查中…'
+    Start-TaskStateAsync           # 计划任务改后台查，界面不卡
     Write-Log2 '---- 状态检查 ----'
     $user = $txtUser.Text.Trim()
     if (-not $user) { $user = Read-CredUser }
@@ -668,8 +847,10 @@ $btnStatus.Add_Click({
 })
 
 $btnLog.Add_Click({
+    Begin-Action $btnLog '正在打开…'
     if (Test-Path $logFile) { Start-Process notepad.exe $logFile }
     else { [System.Windows.Forms.MessageBox]::Show('还没有日志文件（程序尚未运行过）', '提示') }
+    End-Actions
 })
 
 $btnUninstall.Add_Click({
@@ -677,6 +858,7 @@ $btnUninstall.Add_Click({
         '确定要卸载吗？将删除开机自启任务和保存的账号密码。', '确认卸载', 'YesNo', 'Question')
     if ($ans -ne 'Yes') { return }
 
+    Begin-Action $btnUninstall '正在卸载…'
     Write-Log2 '正在删除计划任务…'
     $log = Invoke-TaskScript -Uninstall
     foreach ($line in ($log -split "`r?`n")) { if ($line.Trim()) { Write-Log2 $line } }
@@ -737,6 +919,8 @@ $btnUninstall.Add_Click({
     }
 
     Write-Log2 '卸载完成。如需彻底清除，直接删除本文件夹即可。'
+    Start-TaskStateAsync -Force          # 卸载后计划任务没了，后台重新查一次
+    End-Actions
     Update-State
 })
 
@@ -764,6 +948,7 @@ $form.Add_Shown({
 
     # 界面先显示出来，信息后台去取
     Write-Log2 '正在读取本机信息…'
+    Start-TaskStateAsync            # 计划任务状态放后台查（不卡界面）
     Update-State
     Update-SummaryAsync -Force      # 一次后台调用取回：学号/密码/网络
 })

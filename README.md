@@ -2,7 +2,7 @@
 
 > 开机自动连校园网，掉线自动重连 —— **免安装、带图形界面、内置运行库，下载解压双击就能用**。
 
-**当前版本：`v1.1.0`** · [更新日志](CHANGELOG.md) · [报告问题](https://github.com/ccdyx-001/htu-campus-autoconnect/issues)
+**当前版本：`v1.1.1`** · [更新日志](CHANGELOG.md) · [报告问题](https://github.com/ccdyx-001/htu-campus-autoconnect/issues)
 
 给同学写的小工具：河师大校园网每次都要手动打开认证页面输账号密码，太烦了。
 这个程序会常驻后台，开机自动认证、断网 1 分钟内自动重连，全程无窗口打扰。
@@ -27,9 +27,13 @@
 - **隐私**：账号密码用 Windows DPAPI **加密**后存在你自己电脑上（`%LOCALAPPDATA%\HTUAutoConnect\credentials.dat`），只有本机当前 Windows 用户能解开，不上传任何服务器
 - **纯标准库**：100% Python 标准库实现，源码可读可改
 
+## 界面预览
+
+![界面截图](docs/界面截图.png)
+
 ## 快速开始
 
-1. 到 [Releases](https://github.com/ccdyx-001/htu-campus-autoconnect/releases/latest) 下载 `htu-campus-autoconnect_v1.1.0.zip`（发布包用英文名，避免 GitHub 截断中文文件名），解压到任意位置（桌面也行）
+1. 到 [Releases](https://github.com/ccdyx-001/htu-campus-autoconnect/releases/latest) 下载 `htu-campus-autoconnect_v1.1.1.zip`（发布包用英文名，避免 GitHub 截断中文文件名），解压到任意位置（桌面也行）
 2. 双击 **`点我启动.bat`**
 3. 在窗口里填：**学号** → **上网密码** → 点【保存并安装】
 4. 弹出管理员权限确认框时点 **【是】**（注册开机自启任务需要）
@@ -40,7 +44,7 @@
 ## 目录结构
 
 ```
-校园网自动连接_v1.1.0\      ← 解压后得到的文件夹
+校园网自动连接_v1.1.1\      ← 解压后得到的文件夹
 ├── 点我启动.bat          ← 双击这个
 ├── 卸载.bat
 ├── 使用说明.txt
