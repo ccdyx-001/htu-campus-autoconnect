@@ -73,20 +73,75 @@ function Remove-DesktopShortcut {
     return $false
 }
 
+function Get-AppVersion {
+    # 从主程序里读版本号 —— 只改一处，注册表/界面/日志全都跟着变
+    try {
+        $f = Join-Path $PSScriptRoot 'AutoConnect_htu.py'
+        if (Test-Path $f) {
+            $m = Select-String -Path $f -Pattern '^VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+            if ($m) { return $m.Matches[0].Groups[1].Value }
+        }
+    } catch { }
+    return '1.0.0'
+}
+
+function New-StartMenuShortcut {
+    param([string]$TargetDir)
+    # 在开始菜单里创建快捷方式（真软件都有）
+    $ws = New-Object -ComObject WScript.Shell
+    $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+    if (-not (Test-Path $dir)) { return $null }
+    $lnkPath = Join-Path $dir '校园网自动连接.lnk'
+    $lnk = $ws.CreateShortcut($lnkPath)
+    $lnk.TargetPath = Join-Path $TargetDir 'runtime\pythonw.exe'
+    $lnk.Arguments = '"' + (Join-Path $TargetDir '启动界面.py') + '"'
+    $lnk.WorkingDirectory = $TargetDir
+    if (Test-Path (Join-Path $TargetDir 'logo.ico')) {
+        $lnk.IconLocation = (Join-Path $TargetDir 'logo.ico')
+    }
+    $lnk.Description = '河南师范大学 校园网自动连接'
+    $lnk.Save()
+    return $lnkPath
+}
+
+function Remove-StartMenuShortcut {
+    $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+    $lnkPath = Join-Path $dir '校园网自动连接.lnk'
+    if (Test-Path $lnkPath) {
+        Remove-Item $lnkPath -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    return $false
+}
+
 function Register-UninstallEntry {
     param([string]$TargetDir)
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\HTUAutoConnect'
     New-Item -Path $key -Force | Out-Null
+    $ver = Get-AppVersion
     Set-ItemProperty -Path $key -Name DisplayName -Value '河南师范大学 校园网自动连接'
-    Set-ItemProperty -Path $key -Name DisplayVersion -Value '1.0'
-    Set-ItemProperty -Path $key -Name Publisher -Value 'CWC'
+    Set-ItemProperty -Path $key -Name DisplayVersion -Value $ver
+    Set-ItemProperty -Path $key -Name Publisher -Value '梅川逸夫'
     Set-ItemProperty -Path $key -Name InstallLocation -Value $TargetDir
+    Set-ItemProperty -Path $key -Name InstallDate -Value (Get-Date -Format 'yyyyMMdd')
+    Set-ItemProperty -Path $key -Name URLInfoAbout -Value 'https://github.com/ccdyx-001/htu-campus-autoconnect'
+    Set-ItemProperty -Path $key -Name HelpLink -Value 'https://github.com/ccdyx-001/htu-campus-autoconnect/issues'
+    Set-ItemProperty -Path $key -Name Comments -Value ('校园网自动连接 v' + $ver + ' —— 开机自动认证、断网自动重连')
     if (Test-Path (Join-Path $TargetDir 'logo.ico')) {
         Set-ItemProperty -Path $key -Name DisplayIcon -Value (Join-Path $TargetDir 'logo.ico')
     }
+    # 占用空间（KB，Windows 用来显示"大小"）
+    try {
+        $kb = [int]((Get-ChildItem $TargetDir -Recurse -File -ErrorAction SilentlyContinue |
+                     Measure-Object Length -Sum).Sum / 1KB)
+        if ($kb -gt 0) { Set-ItemProperty -Path $key -Name EstimatedSize -Value $kb -Type DWord }
+    } catch { }
     $py = Join-Path $TargetDir 'runtime\python.exe'
     $un = Join-Path $TargetDir '卸载程序.py'
-    Set-ItemProperty -Path $key -Name UninstallString -Value ('"' + $py + '" "' + $un + '"')
+    # 从「设置→应用」卸载：会弹出窗口问你要保留什么（--from-panel）
+    Set-ItemProperty -Path $key -Name UninstallString -Value ('"' + $py + '" "' + $un + '" --from-panel')
+    # 静默卸载（脚本/批量用）：全自动，不提问
+    Set-ItemProperty -Path $key -Name QuietUninstallString -Value ('"' + $py + '" "' + $un + '" --yes')
     Set-ItemProperty -Path $key -Name NoModify -Value 1 -Type DWord
     Set-ItemProperty -Path $key -Name NoRepair -Value 1 -Type DWord
     return $key

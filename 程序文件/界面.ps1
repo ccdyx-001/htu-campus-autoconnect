@@ -210,6 +210,7 @@ function Save-Cred {
 
 # ---------------- 作者信息 ----------------
 
+$APP_VERSION = '1.0.0'
 $AUTHOR_NAME = '梅川逸夫'
 $AUTHOR_ID   = ''
 
@@ -218,9 +219,10 @@ function Show-About {
         '河南师范大学  校园网自动连接',
         '',
         ('作者：{0}' -f $AUTHOR_NAME),
-        '版本：1.0（绿色版）',
+        '版本：v' + $APP_VERSION + '（免费开源版）',
         '',
-        '免费开源，直接填学号和密码就能用。',
+        '版本 v' + $APP_VERSION + '（免费开源，MIT 许可）',
+        '直接填学号和密码就能用，不需要注册码。',
         '',
         '账号密码只保存在你自己电脑上，不会上传到任何服务器。'
     ) -join "`r`n"
@@ -295,7 +297,7 @@ $fontNormal = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 $fontMono = New-Object System.Drawing.Font('Consolas', 9)
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = '河南师范大学 校园网自动连接'
+$form.Text = '河南师范大学 校园网自动连接 v' + $APP_VERSION
 $form.Size = New-Object System.Drawing.Size(580, 648)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
@@ -526,7 +528,11 @@ function Complete-Install {
         } catch { Write-Log2 ('创建快捷方式失败：' + $_.Exception.Message) }
         try {
             [void](Register-UninstallEntry -TargetDir $target)
-            Write-Log2 '已登记到「设置 → 应用」，以后可以在那里卸载'
+            Write-Log2 ('已登记到「设置 → 应用」和「控制面板 → 程序和功能」（版本 v' + (Get-AppVersion) + '）')
+        } catch { }
+        try {
+            $sm = New-StartMenuShortcut -TargetDir $target
+            if ($sm) { Write-Log2 '已创建开始菜单快捷方式' }
         } catch { }
     }
 
@@ -681,7 +687,7 @@ $form.Add_Shown({
         $txtUser.Text = $u
         Write-Log2 ("已检测到已保存的账号：{0}" -f $u)
     } else {
-        Write-Log2 ('本工具由 ' + $AUTHOR_NAME + ' 制作（免费开源）')
+        Write-Log2 ('河南师范大学 校园网自动连接  v' + $APP_VERSION + '  by ' + $AUTHOR_NAME + '（免费开源）')
         Write-Log2 '欢迎使用！请填写：学号 → 上网密码，然后点【保存并安装】。'
         Write-Log2 '（密码默认隐藏，可勾选“显示密码”核对；账号密码只保存在本机）'
     }

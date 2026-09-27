@@ -10,6 +10,32 @@ import subprocess
 import sys
 import time
 
+class _Tee:
+    """同时往控制台和日志文件写，卸载出问题能翻日志"""
+
+    def __init__(self, path):
+        self.f = open(path, "w", encoding="utf-8")
+        self.out = sys.stdout
+
+    def write(self, s):
+        try:
+            if self.out is not None:
+                self.out.write(s)
+        except Exception:
+            pass
+        try:
+            self.f.write(s)
+            self.f.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            if self.out is not None:
+                self.out.flush()
+        except Exception:
+            pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASK_PS1 = os.path.join(HERE, "setup_task.ps1")
 MAIN_PY = os.path.join(HERE, "AutoConnect_htu.py")
@@ -22,7 +48,11 @@ REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\HTUAutoConnect"
 INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "HTUAutoConnect")
 
 
-def ask(prompt, default="n"):
+def ask(prompt, default="n", auto=None):
+    """auto 不为 None 时（--yes 全自动模式）直接用 auto，不等人回答"""
+    if auto is not None:
+        print(prompt + ("[自动: %s]" % auto))
+        return auto
     try:
         ans = input(prompt).strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -61,6 +91,19 @@ def remove_shortcut():
                 return name
             except Exception as e:
                 return "删除失败：{0}".format(e)
+    return None
+
+
+def remove_startmenu_shortcut():
+    """删除开始菜单里的快捷方式"""
+    d = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs")
+    p = os.path.join(d, SHORTCUT_NAME)
+    if os.path.exists(p):
+        try:
+            os.remove(p)
+            return True
+        except Exception:
+            pass
     return None
 
 
@@ -119,7 +162,32 @@ def schedule_self_delete(path):
 
 def main():
     dry = "--dry-run" in sys.argv
-    auto_yes = "--yes" in sys.argv or dry
+    auto_yes = "--yes" in sys.argv or dry        # 全自动静默（不提问）
+    from_panel = "--from-panel" in sys.argv      # 从「设置→应用」卸载：提问，但等你按键才关窗口
+    _old_stdout = sys.stdout
+    if not dry and sys.stdout is not None:
+        try:
+            sys.stdout = _Tee(os.path.join(os.environ.get("TEMP", "."), "HTU卸载日志.txt"))
+            print("=== 校园网自动连接 卸载日志 ===")
+            print("时间:", time.strftime("%Y-%m-%d %H:%M:%S"))
+            print("脚本位置:", HERE)
+            print("安装目录:", INSTALL_DIR)
+            print()
+        except Exception:
+            pass
+    log_lines = []
+
+    def note(msg):
+        print(msg)
+        log_lines.append(msg)
+
+    def safe(label, fn, *a, **kw):
+        """每一步都兜住异常：失败也继续往下，绝不半途而废"""
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            note("       [X] %s 失败：%s" % (label, e))
+            return None
     print("=" * 60)
     print("     卸载 校园网自动连接")
     print("=" * 60)
@@ -142,7 +210,7 @@ def main():
 
     print("  即将弹出管理员权限确认框，请点 [是]")
     print()
-    if not auto_yes:
+    if not auto_yes and not from_panel:
         try:
             input("  按回车继续……")
         except (EOFError, KeyboardInterrupt):
@@ -153,23 +221,25 @@ def main():
     if dry:
         print("       （测试模式：跳过）")
     else:
-        run_elevated_uninstall()
+        safe("删除计划任务", run_elevated_uninstall)
 
     print()
     print("  [2/6] 删除桌面快捷方式 ......")
     if dry:
         print("       （测试模式：跳过）")
     else:
-        r = remove_shortcut()
+        r = safe("删除桌面快捷方式", remove_shortcut)
         print("       已删除 " + r if isinstance(r, str) and r.endswith(".lnk") else
               ("       没有找到桌面快捷方式" if r is None else "       " + str(r)))
+        if safe("删除开始菜单快捷方式", remove_startmenu_shortcut):
+            print("       已删除开始菜单快捷方式")
 
     print()
     print("  [3/6] 从「设置 → 应用」中移除 ......")
     if dry:
         print("       （测试模式：跳过）")
     else:
-        r = remove_reg_entry()
+        r = safe("删除面板条目", remove_reg_entry)
         print("       已移除" if r is True else ("       本来就没有登记" if r is None else "       " + str(r)))
 
     print()
@@ -191,7 +261,7 @@ def main():
 
     print()
     print("  [5/6] 断开校园网认证 ......")
-    ans = "n" if dry else ask("       是否立即断开校园网认证？(y/N) ")
+    ans = ask("       是否立即断开校园网认证？(y/N) ", default="n", auto=("n" if auto_yes else None))
     if ans == "y":
         try:
             r = subprocess.run([sys.executable, MAIN_PY, "--logout"], cwd=HERE,
@@ -205,7 +275,7 @@ def main():
 
     print()
     print("  [6/6] 运行日志处理 ......")
-    ans3 = "n" if dry else ask("       是否删除运行日志？(y/N) ")
+    ans3 = ask("       是否删除运行日志？(y/N) ", default="n", auto=("y" if auto_yes else None))
     logstatus = "已保留"
     if ans3 == "y":
         for f in LOG_FILES:
@@ -228,7 +298,7 @@ def main():
             print("       " + INSTALL_DIR)
             self_delete = True
         else:
-            ans4 = ask("       是否删除安装到本机的程序文件？(y/N) ")
+            ans4 = ask("       是否删除安装到本机的程序文件？(Y/n) ", default="y", auto=("y" if auto_yes else None))
             if ans4 == "y":
                 try:
                     subprocess.run(["cmd.exe", "/c", "rmdir", "/s", "/q", INSTALL_DIR],
@@ -258,6 +328,16 @@ def main():
     print()
     if self_delete:
         schedule_self_delete(INSTALL_DIR)
+    if from_panel and not auto_yes:
+        try:
+            print("  （按回车关闭此窗口）")
+            input()
+        except (EOFError, KeyboardInterrupt):
+            pass
+    try:
+        sys.stdout = _old_stdout          # 恢复标准输出（别影响调用方）
+    except Exception:
+        pass
     return 0
 
 

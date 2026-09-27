@@ -51,6 +51,9 @@ PORTAL_PROBES = [
     "http://connect.rom.miui.com/generate_204",
 ]
 
+# ---- 版本号（改程序时记得同步更新 CHANGELOG.md）----
+VERSION = "1.0.0"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CRED_FILE = os.path.join(SCRIPT_DIR, "credentials.env")
 LOG_FILE = os.path.join(SCRIPT_DIR, "autoconnect.log")
@@ -423,7 +426,7 @@ def print_info():
         online = True
     except Exception:
         online = False
-    print(json.dumps({"user": u, "pwd": p, "online": online,
+    print(json.dumps({"version": VERSION, "user": u, "pwd": p, "online": online,
                       "has_cred": bool(u and p)}, ensure_ascii=False))
 
 
