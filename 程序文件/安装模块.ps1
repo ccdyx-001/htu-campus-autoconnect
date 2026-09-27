@@ -82,7 +82,7 @@ function Get-AppVersion {
             if ($m) { return $m.Matches[0].Groups[1].Value }
         }
     } catch { }
-    return '1.0.0'
+    return '1.1.0'
 }
 
 function New-StartMenuShortcut {

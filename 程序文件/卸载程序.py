@@ -196,7 +196,7 @@ def main():
     print("     1) 删除开机自启的计划任务")
     print("     2) 删除桌面快捷方式")
     print("     3) 从「设置 → 应用」中移除")
-    print("     4) 删除保存的账号密码（加密文件）")
+    print("     4) 处理保存的账号密码（可自己选保留还是删除）")
     print("     5) 断开校园网认证（可选）")
     print("     6) 删除运行日志（可选，默认保留）")
     print()
@@ -243,21 +243,46 @@ def main():
         print("       已移除" if r is True else ("       本来就没有登记" if r is None else "       " + str(r)))
 
     print()
-    print("  [4/6] 删除账号密码文件 ......")
-    found = []
-    for f in CRED_FILES:
-        p = os.path.join(HERE, f)
-        if os.path.exists(p):
-            found.append(f)
-            if not dry:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-    if found:
-        print(("       已删除：" if not dry else "       （测试模式）将会删除：") + "、".join(found))
-    else:
+    print("  [4/6] 处理账号密码文件 ......")
+    # 账号文件可能在两个地方：当前目录（绿色版/解压目录）、以及安装到本机的目录。
+    # 旧版本只删"当前目录"，结果真正在用的那份（安装目录里的）反而留下来了 —— 这里一起处理。
+    cred_dirs = [HERE]
+    if os.path.exists(INSTALL_DIR) and not same_dir(HERE, INSTALL_DIR):
+        cred_dirs.append(INSTALL_DIR)
+    cred_paths, cred_labels = [], []
+    for d in cred_dirs:
+        for f in CRED_FILES:
+            p = os.path.join(d, f)
+            if os.path.exists(p) and p not in cred_paths:
+                cred_paths.append(p)
+                cred_labels.append(f if same_dir(d, HERE) else (f + "（安装目录）"))
+    credstatus = "没有账号文件"
+    if not cred_paths:
         print("       没有找到账号密码文件（可能已经删过了）")
+    else:
+        print("       找到：" + "、".join(cred_labels))
+        if dry:
+            print("       （测试模式：不做修改；实际运行时这里会问你要不要保留）")
+            credstatus = "（测试模式，未改动）"
+        else:
+            keep = ask("       要保留账号密码文件吗？(Y=保留 / n=删除) ",
+                       default="y", auto=("y" if auto_yes else None))
+            if keep == "y":
+                print("       已保留账号密码（以后重新安装不用再输一遍）")
+                credstatus = "已保留"
+            else:
+                gone, fail = [], []
+                for p, lab in zip(cred_paths, cred_labels):
+                    try:
+                        os.remove(p)
+                        gone.append(lab)
+                    except Exception:
+                        fail.append(lab)
+                if gone:
+                    print("       已删除：" + "、".join(gone))
+                if fail:
+                    print("       [X] 没删掉（可能有程序正在用）：" + "、".join(fail))
+                credstatus = "已删除" if not fail else "部分删除失败"
 
     print()
     print("  [5/6] 断开校园网认证 ......")
@@ -316,7 +341,7 @@ def main():
     print("  卸载完成")
     print("     · 计划任务     已删除，不会再自动连接校园网")
     print("     · 桌面快捷方式 已清理")
-    print("     · 账号密码     已删除")
+    print("     · 账号密码     " + credstatus)
     print("     · 运行日志     " + logstatus)
     print("=" * 60)
     print()
@@ -324,7 +349,7 @@ def main():
         print("  关掉本窗口后，程序文件夹会自动删除（约 3 秒）")
     else:
         print("  彻底清除：直接删掉整个文件夹即可")
-    print("  （账号密码已删除；想再装回来，重新填一次学号和密码即可）")
+    print("  （账号密码" + ("已保留：重新安装后不用再输一遍" if credstatus == "已保留" else ("已删除：想再装回来，重新填一次学号和密码即可" if credstatus == "已删除" else credstatus)) + "）")
     print()
     if self_delete:
         schedule_self_delete(INSTALL_DIR)

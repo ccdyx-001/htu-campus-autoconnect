@@ -13,7 +13,7 @@
 
  使用方法（普通用户看这里）：
    双击上一层的【点我启动.bat】，在窗口里填学号和密码，
-   点【激活】再点【保存并安装】即可（程序会自动安装到本机）。
+   点【保存并安装】即可（程序会自动安装到本机并注册开机自启）。
 
  命令行用法（进阶）：
    python AutoConnect_htu.py --setup            交互式配置账号密码
@@ -21,11 +21,21 @@
    python AutoConnect_htu.py --force            强制认证一次（测试用）
    python AutoConnect_htu.py --logout           主动下线
    python AutoConnect_htu.py --status           只报告当前是否已联网
+   python AutoConnect_htu.py --save-cred        保存账号（图形界面调用，账号通过环境变量传入）
+   python AutoConnect_htu.py --check-cred       检查账号文件状态（加密 / 明文 / 解不开）
+   python AutoConnect_htu.py --seal             把旧版明文账号文件升级成加密文件
    python AutoConnect_htu.py 学号 密码           直接指定账号密码
 
- 账号密码保存在同目录的 credentials.env（只存在你本机，不会上传）
+ 账号密码保存在同目录的 credentials.dat：
+   · v1.1.0 起用 Windows DPAPI 加密保存，密钥由 Windows 掌管，
+     绑定"这台电脑 + 当前 Windows 用户"；复制到别的电脑、别的用户，或被改动过，都解不开
+   · 从 v1.0.0 升级：第一次运行时自动把旧的明文 credentials.env
+     加密成 credentials.dat，并删掉明文文件（升级失败会保留明文，保证能用）
+   · 无论哪种方式，账号都只存在本机，不会上传到任何服务器
 ============================================================
 """
+import base64
+import ctypes
 import datetime
 import email.utils
 import json
@@ -52,10 +62,12 @@ PORTAL_PROBES = [
 ]
 
 # ---- 版本号（改程序时记得同步更新 CHANGELOG.md）----
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CRED_FILE = os.path.join(SCRIPT_DIR, "credentials.env")
+CRED_FILE = os.path.join(SCRIPT_DIR, "credentials.env")        # v1.0.0 的明文文件（现在只用于自动升级）
+CRED_FILE_DAT = os.path.join(SCRIPT_DIR, "credentials.dat")    # v1.1.0 起的加密文件（Windows DPAPI）
+USER_FILE = os.path.join(SCRIPT_DIR, ".user")                  # 只存学号，供界面显示（不含密码）
 LOG_FILE = os.path.join(SCRIPT_DIR, "autoconnect.log")
 HEARTBEAT_FILE = os.path.join(SCRIPT_DIR, ".last_heartbeat")
 HEARTBEAT_INTERVAL = 1800   # 正常联网时，日志最多每 30 分钟记一条，避免刷屏
@@ -127,9 +139,175 @@ def log_heartbeat(msg):
         pass
 
 
-def load_credentials_file():
+# ============================================================
+#  账号文件：Windows DPAPI 加密（v1.1.0 起）
+# ============================================================
+#  为什么改：v1.0.0 把学号密码明文写在 credentials.env 里，
+#  任何能打开这台电脑的人（或者不小心把文件夹/压缩包发给别人）
+#  都能直接用记事本看到密码。
+#
+#  现在改成调用 Windows 自带的 DPAPI 加密：
+#    · 密钥由 Windows 自己掌管，绑定"这台电脑 + 当前 Windows 用户"
+#    · 文件被复制到别的电脑、别的 Windows 账户，或者被改动过一个字节 → 都解不开
+#    · 不需要用户自己记密码，程序运行时自动解密（开机自动连不受影响）
+#    · 纯标准库实现（ctypes 调 crypt32.dll），不依赖任何第三方库
+#
+#  文件格式（credentials.dat，文本文件，方便排查）：
+#    FORMAT=HTUDPAPI1
+#    DATA=<DPAPI 密文的 base64>
+
+CRED_FORMAT = "HTUDPAPI1"
+_CRED_MODE = "none"       # dpapi / plain / none / undecryptable
+_CRED_LOADED = False      # 账号文件是否已经读过（避免同一进程里重复读、重复报警告）
+
+# CRYPTPROTECT_UI_FORBIDDEN：禁止弹任何窗口。
+# 必须带上：计划任务是隐藏运行的，万一系统想弹窗确认就会卡死在那里。
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi_call(func_name, data):
+    """调用 crypt32.dll 的 CryptProtectData / CryptUnprotectData（纯标准库）"""
+    if os.name != "nt":
+        raise RuntimeError("当前系统不是 Windows，DPAPI 不可用")
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    fn = getattr(crypt32, func_name)
+    # 必须显式声明参数类型：否则 64 位下指针会被截断成 32 位，直接崩
+    fn.argtypes = [ctypes.POINTER(_DATA_BLOB), ctypes.c_wchar_p,
+                   ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p,
+                   ctypes.c_void_p, ctypes.c_uint32,
+                   ctypes.POINTER(_DATA_BLOB)]
+    fn.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    buf = ctypes.create_string_buffer(bytes(data), max(1, len(data)))
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    ok = fn(ctypes.byref(blob_in), None, None, None, None,
+            _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out))
+    if not ok:
+        raise OSError(ctypes.get_last_error(),
+                      "{0} 调用失败".format(func_name))
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def dpapi_encrypt(data):
+    """加密（只能被当前 Windows 用户解开）"""
+    return _dpapi_call("CryptProtectData", data)
+
+
+def dpapi_decrypt(blob):
+    """解密（不是本机本用户加密的，就会失败）"""
+    return _dpapi_call("CryptUnprotectData", blob)
+
+
+def _write_user_file(user):
+    """单独记一份学号（不含密码），供界面启动时立刻显示"""
+    try:
+        with open(USER_FILE, "w", encoding="utf-8", newline="\n") as f:
+            f.write(user)
+    except Exception:
+        pass
+
+
+def _write_plain_env(user, password):
+    """明文保存（只在 DPAPI 不可用时兜底，例如把本工具移植到 Linux 跑）"""
+    with open(CRED_FILE, "w", encoding="utf-8") as f:
+        f.write("# 校园网上网账号（此文件只在本机保存，请勿外传）\n")
+        f.write("CAMPUS_USER={0}\n".format(user))
+        f.write("CAMPUS_PASSWORD={0}\n".format(password))
+
+
+def _read_cred_dat():
+    """读加密账号文件，返回 (状态, 学号, 密码)
+
+    状态：ok / empty（文件不存在）/ broken（格式不对）/ undecryptable（解不开）
+    """
+    if not os.path.exists(CRED_FILE_DAT):
+        return "empty", "", ""
+    fmt, b64 = "", ""
+    try:
+        with open(CRED_FILE_DAT, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip().upper(), v.strip()
+                if k == "FORMAT":
+                    fmt = v
+                elif k == "DATA":
+                    b64 = v
+    except Exception as e:
+        log("读取 credentials.dat 失败：{0}".format(e))
+        return "broken", "", ""
+    if fmt != CRED_FORMAT or not b64:
+        return "broken", "", ""
+    try:
+        text = dpapi_decrypt(base64.b64decode(b64)).decode("utf-8", "replace")
+    except Exception as e:
+        log("解密 credentials.dat 失败：{0}".format(e))
+        return "undecryptable", "", ""
+    user, _, pwd = text.partition("\n")
+    user, pwd = user.strip(), pwd.strip()
+    if not (user and pwd):
+        return "broken", "", ""
+    return "ok", user, pwd
+
+
+def save_credentials_file(user, password):
+    """保存账号密码（加密），返回 'dpapi' 或 'plain'
+
+    加密后会立刻回读校验一次：确保"存进去的一定解得开"，
+    避免出现"文件写坏了、下次开机解不开"这种最难查的问题。
+    """
+    payload = "{0}\n{1}".format(user, password).encode("utf-8")
+    try:
+        blob = dpapi_encrypt(payload)
+    except Exception as e:
+        log("[WARN] 系统加密不可用（{0}），退回明文保存".format(e))
+        _write_plain_env(user, password)
+        _write_user_file(user)
+        return "plain"
+
+    text = "\n".join([
+        "# 河南师范大学 校园网自动连接 —— 账号文件",
+        "# 已用 Windows DPAPI 加密：只有本机 + 当前 Windows 用户能解开，不用自己记密码。",
+        "# 复制到别的电脑 / 别的 Windows 账户 / 被改动过：都会解不开，需要重新填写账号。",
+        "# 想清除账号：删除本文件即可（密码不会留在任何地方）。",
+        "FORMAT=" + CRED_FORMAT,
+        "DATA=" + base64.b64encode(blob).decode("ascii"),
+        "",
+    ])
+    tmp = CRED_FILE_DAT + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, CRED_FILE_DAT)
+    _write_user_file(user)
+
+    state, u2, p2 = _read_cred_dat()
+    if not (state == "ok" and u2 == user and p2 == password):
+        raise RuntimeError("加密文件回读校验失败（状态={0}）".format(state))
+
+    os.environ["CAMPUS_USER"] = user
+    os.environ["CAMPUS_PASSWORD"] = password
+    return "dpapi"
+
+
+def _load_plain_env():
+    """读 v1.0.0 的明文 credentials.env（只用于自动升级）"""
     if not os.path.exists(CRED_FILE):
-        return
+        return False
+    got = False
     try:
         with open(CRED_FILE, "r", encoding="utf-8") as f:
             for raw in f:
@@ -140,29 +318,157 @@ def load_credentials_file():
                 k, v = k.strip(), v.strip().strip('"').strip("'")
                 if k and k not in os.environ:
                     os.environ[k] = v
+                    got = True
     except Exception as e:
         log("读取 credentials.env 失败：{0}".format(e))
+    return got
 
 
-def save_credentials_file(user, password):
-    with open(CRED_FILE, "w", encoding="utf-8") as f:
-        f.write("# 校园网上网账号（此文件只在本机保存，请勿外传）\n")
-        f.write("CAMPUS_USER={0}\n".format(user))
-        f.write("CAMPUS_PASSWORD={0}\n".format(password))
+def migrate_plain_credentials():
+    """把 v1.0.0 的明文账号升级成加密文件，成功则删除明文"""
+    user = os.environ.get("CAMPUS_USER", "")
+    pwd = os.environ.get("CAMPUS_PASSWORD", "")
+    if not (user and pwd):
+        return False
+    try:
+        mode = save_credentials_file(user, pwd)          # 内部已做回读校验
+    except Exception as e:
+        log("[WARN] 明文账号升级加密失败（继续用明文，功能不受影响）：{0}".format(e))
+        return False
+    if mode != "dpapi":
+        return False
+    try:
+        os.remove(CRED_FILE)
+        log("[OK] 账号文件已升级为 Windows 加密版（credentials.dat），明文文件已删除")
+    except Exception as e:
+        log("[WARN] 明文文件删除失败：{0}（可手动删除 credentials.env）".format(e))
+    return True
 
 
 # ---- 账号配置文件 ----
 
 
+def _load_credentials_impl():
+    """读取账号密码（优先级：加密文件 → v1.0.0 明文文件 → 无）
+
+    读到明文会自动升级成加密文件；升级失败则继续用明文，保证程序照常能用。
+    返回读到的状态：dpapi / plain / none / undecryptable
+    """
+    global _CRED_MODE
+
+    if os.path.exists(CRED_FILE_DAT):
+        state, user, pwd = _read_cred_dat()
+        if state == "ok":
+            if "CAMPUS_USER" not in os.environ:
+                os.environ["CAMPUS_USER"] = user
+            if "CAMPUS_PASSWORD" not in os.environ:
+                os.environ["CAMPUS_PASSWORD"] = pwd
+            if not os.path.exists(USER_FILE):
+                _write_user_file(user)
+            _CRED_MODE = "dpapi"
+            return _CRED_MODE
+        if state == "undecryptable":
+            _CRED_MODE = "undecryptable"
+            log("[WARN] 账号文件解不开（credentials.dat）")
+            log("       常见原因：① 换了电脑 ② 换了 Windows 用户 ③ 文件被改过 / 被别的程序动过")
+            log("       处理办法：打开界面重新填一次学号密码并保存，或删掉 credentials.dat 重新配置")
+            return _CRED_MODE
+        log("[WARN] 账号文件格式不对（credentials.dat），请重新填写一次账号")
+
+    if _load_plain_env():
+        _CRED_MODE = "plain"
+        if migrate_plain_credentials():
+            _CRED_MODE = "dpapi"
+        return _CRED_MODE
+
+    if _CRED_MODE != "undecryptable":
+        _CRED_MODE = "none"
+    return _CRED_MODE
+
+
+def load_credentials_file(force=False):
+    """读账号（带缓存）：同一个进程里只真正读一次
+
+    为什么加缓存：--info / --check-cred 这类命令会调用两次（main 一次、命令自己一次），
+    不加缓存的话同一句"账号文件解不开"的警告会在界面日志里打印两遍。
+    """
+    global _CRED_LOADED
+    if _CRED_LOADED and not force:
+        return _CRED_MODE
+    mode = _load_credentials_impl()
+    _CRED_LOADED = True
+    return mode
+
+
 def get_credentials():
     """读取账号密码，返回 (user, password, mode)
 
-    mode: plain=读到了 / none=没配置
+    mode: dpapi=加密文件读到 / plain=明文（旧格式）/ none=没配置
+          undecryptable=文件在但解不开（需要用户重新填写）
     """
-    load_credentials_file()
+    mode = load_credentials_file()
     u = os.environ.get("CAMPUS_USER", "")
     p = os.environ.get("CAMPUS_PASSWORD", "")
-    return u, p, ("plain" if (u and p) else "none")
+    if u and p:
+        return u, p, mode
+    return "", "", ("undecryptable" if mode == "undecryptable" else "none")
+
+
+# ---- 账号相关的命令行入口（图形界面调用）----
+
+
+def save_cred_cmd(argv):
+    """保存账号（--save-cred）
+
+    账号密码通过环境变量 HTU_NEW_USER / HTU_NEW_PWD 传进来，
+    不走命令行参数 —— 避免密码出现在任务管理器的进程命令行里。
+    """
+    user = os.environ.get("HTU_NEW_USER", "").strip()
+    pwd = os.environ.get("HTU_NEW_PWD", "")
+    if not user or not pwd:
+        print("SAVE_CRED=FAIL 缺少账号或密码")
+        return 2
+    if "@" in user:
+        user = user.split("@")[0]
+    try:
+        mode = save_credentials_file(user, pwd)
+    except Exception as e:
+        print("SAVE_CRED=FAIL {0}".format(e))
+        return 1
+    print("SAVE_CRED=OK mode={0} user={1}".format(mode, user))
+    return 0
+
+
+def check_cred_cmd():
+    """检查账号文件状态（--check-cred）"""
+    mode = load_credentials_file()
+    u = os.environ.get("CAMPUS_USER", "")
+    hint = {
+        "dpapi": "已用 Windows 加密保存（只有本机当前用户能解开）",
+        "plain": "明文保存（旧版本格式，重新保存一次即可加密）",
+        "none": "还没有保存账号",
+        "undecryptable": "解不开：换了电脑 / 换了 Windows 用户 / 文件被改动过，请重新填写",
+    }.get(mode, mode)
+    print("CRED={0} user={1} 说明：{2}".format(mode, u or "-", hint))
+    if mode == "undecryptable":
+        return 3
+    return 0 if (u and mode in ("dpapi", "plain")) else 2
+
+
+def seal_cmd():
+    """把明文账号文件升级成加密文件（--seal），不需要联网"""
+    if not os.path.exists(CRED_FILE):
+        if os.path.exists(CRED_FILE_DAT):
+            print("SEAL=SKIP 账号已经是加密保存的（credentials.dat）")
+            return 0
+        print("SEAL=FAIL 没有找到账号文件，请先用界面或 --setup 保存账号")
+        return 2
+    _load_plain_env()
+    if migrate_plain_credentials():
+        print("SEAL=OK 已加密保存为 credentials.dat，明文文件已删除")
+        return 0
+    print("SEAL=FAIL 加密失败，明文文件已保留（功能不受影响）")
+    return 1
 
 
 # ---------------- 网络探测 ----------------
@@ -416,7 +722,7 @@ def login(user, password, force=False):
 
 def print_info():
     """给图形界面用：一次性输出账号/网络状态（JSON）"""
-    load_credentials_file()
+    mode = load_credentials_file()
     u = os.environ.get("CAMPUS_USER", "")
     p = os.environ.get("CAMPUS_PASSWORD", "")
     try:
@@ -427,7 +733,8 @@ def print_info():
     except Exception:
         online = False
     print(json.dumps({"version": VERSION, "user": u, "pwd": p, "online": online,
-                      "has_cred": bool(u and p)}, ensure_ascii=False))
+                      "has_cred": bool(u and p), "cred_state": mode},
+                     ensure_ascii=False))
 
 
 def logout():
@@ -466,7 +773,7 @@ def _setup_interactive():
     print("  河南师范大学 校园网自动连接 - 账号配置")
     print("=" * 52)
     print("  提示：账号为学号；密码默认为 Myhtu+身份证第12-17位")
-    print("  账号密码只保存在本机 credentials.env，不会上传任何服务器")
+    print("  账号密码只保存在本机（Windows 加密的 credentials.dat），不会上传任何服务器")
     print()
 
     discover_portal()
@@ -507,9 +814,18 @@ def _setup_interactive():
 
 
 def main():
-    load_credentials_file()
     argv = sys.argv[1:]
     force = "--force" in argv
+
+    # 这两个命令自己负责读写账号文件，必须放在最前面：
+    # 否则 main 开头的 load_credentials_file() 会先把明文自动升级掉，
+    # 轮到 --seal 时就"没活可干"，明明干了事却报 SKIP
+    if "--save-cred" in argv:
+        return save_cred_cmd(argv)
+    if "--seal" in argv:
+        return seal_cmd()
+
+    load_credentials_file()
 
     if "--setup" in argv:
         return setup()
@@ -518,6 +834,8 @@ def main():
     if "--info" in argv:
         print_info()
         return 0
+    if "--check-cred" in argv:
+        return check_cred_cmd()
     if "--status" in argv:
         # 供图形界面调用：只报告当前是否已认证（严格判定：204 且未被 AC 劫持）
         print("ONLINE" if is_online() else "OFFLINE")
@@ -528,7 +846,9 @@ def main():
     if len(rest) >= 2:                      # 命令行直接给了账号密码
         user, password, mode = rest[0], rest[1], "argv"
 
-    if mode == "sealed-fail":
+    if mode == "undecryptable":
+        log("[FAIL] 账号文件解不开（credentials.dat）：换了电脑 / 换了 Windows 用户 / 文件被改动过")
+        log("       请在界面里重新填写学号密码并保存；或删掉该文件后重新配置")
         return 3
     if not user or not password:
         log("缺少账号/密码：请先运行  python AutoConnect_htu.py --setup  完成配置")

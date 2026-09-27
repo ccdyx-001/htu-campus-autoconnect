@@ -19,7 +19,9 @@ $pyExe      = Join-Path $root 'runtime\python.exe'
 if (-not (Test-Path $pyExe)) { $pyExe = 'python' }
 $mainPy     = Join-Path $root 'AutoConnect_htu.py'
 $taskPs1    = Join-Path $root 'setup_task.ps1'
-$credFile   = Join-Path $root 'credentials.env'
+$credFile   = Join-Path $root 'credentials.env'   # v1.0.0 的明文账号文件（现在只用于兼容/清理）
+$credDat    = Join-Path $root 'credentials.dat'   # v1.1.0 起：Windows DPAPI 加密的账号文件
+$userFile   = Join-Path $root '.user'             # 只存学号（界面启动时立刻显示用，不含密码）
 $logFile    = Join-Path $root 'autoconnect.log'
 $installLog = Join-Path $root 'install_log.txt'
 $TaskName   = 'HTU Campus AutoConnect'
@@ -31,7 +33,7 @@ if (Test-Path $installMod) { . $installMod }
 # ---------------- 底层工具函数 ----------------
 
 function Get-PyStartInfo {
-    param([string[]]$PyArgs = @())
+    param([string[]]$PyArgs = @(), [hashtable]$EnvExtra = $null)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $pyExe
     $psi.Arguments = (($PyArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
@@ -43,15 +45,23 @@ function Get-PyStartInfo {
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     try { $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8' } catch { }
+    # 额外环境变量：用于把"要保存的账号密码"传进去
+    # （走环境变量而不是命令行参数，避免密码出现在任务管理器的进程命令行里）
+    if ($EnvExtra) {
+        foreach ($k in $EnvExtra.Keys) {
+            try { $psi.EnvironmentVariables[[string]$k] = [string]$EnvExtra[$k] } catch { }
+        }
+    }
     return $psi
 }
 
 function Invoke-Py {
-    param([string[]]$PyArgs = @())
-    $p = [System.Diagnostics.Process]::Start((Get-PyStartInfo $PyArgs))
+    param([string[]]$PyArgs = @(), [hashtable]$EnvExtra = $null)
+    $p = [System.Diagnostics.Process]::Start((Get-PyStartInfo -PyArgs $PyArgs -EnvExtra $EnvExtra))
     $out = $p.StandardOutput.ReadToEnd()
     $err = $p.StandardError.ReadToEnd()
     $p.WaitForExit()
+    $script:LastPyExit = $p.ExitCode
     return (($out + "`r`n" + $err).Trim())
 }
 
@@ -81,10 +91,11 @@ function Start-PyAsync {
         [string]$BusyText = '处理中',
         [scriptblock]$OnDone = $null,
         [int]$TimeoutSec = 90,
+        [hashtable]$EnvExtra = $null,
         [switch]$Silent          # 静默模式：不锁界面、不显示"忙"提示（用于后台刷新）
     )
     try {
-        $p = [System.Diagnostics.Process]::Start((Get-PyStartInfo $PyArgs))
+        $p = [System.Diagnostics.Process]::Start((Get-PyStartInfo -PyArgs $PyArgs -EnvExtra $EnvExtra))
     } catch {
         Write-Log2 ('启动失败：' + $_.Exception.Message)
         return $false
@@ -135,9 +146,11 @@ function Update-SummaryAsync {
     [void](Start-PyAsync -PyArgs @($mainPy, '--info') -BusyText '' -TimeoutSec 25 -Silent -OnDone {
         param($out, $code)
         $script:SumJob = $false
-        $line = ($out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-        if ($line -match '^\s*\{') {
-            try { $script:Summary = $line | ConvertFrom-Json } catch { }
+        # 取输出里第一行以 { 开头的 JSON
+        # （不能只看第一行：升级账号文件时前面会先打印"已升级为加密版"之类的提示行）
+        $line = ($out -split "`r?`n" | Where-Object { $_.Trim() -match '^\{' } | Select-Object -First 1)
+        if ($line) {
+            try { $script:Summary = $line.Trim() | ConvertFrom-Json } catch { }
         }
         if ($script:Summary) {
             $s = $script:Summary
@@ -192,25 +205,42 @@ function Invoke-TaskScript {
 }
 
 function Read-CredUser {
+    # v1.1.0 起：学号单独记在 .user 里（密码在加密文件里，界面读不到、也不需要读）
+    if (Test-Path $userFile) {
+        $u = (Get-Content $userFile -Raw -Encoding UTF8).Trim()
+        if ($u) { return $u }
+    }
+    # 兼容 v1.0.0 的明文文件（升级后这个文件会自动消失）
     if (Test-Path $credFile) {
         foreach ($line in Get-Content $credFile -Encoding UTF8) {
             if ($line -match '^\s*CAMPUS_USER\s*=\s*(.+)$') { return $Matches[1].Trim() }
         }
     }
-    $uf = Join-Path $root '.user'
-    if (Test-Path $uf) { return (Get-Content $uf -Raw -Encoding UTF8).Trim() }
     return ''
 }
 
 function Save-Cred {
+    # 保存账号：交给 Python 用 Windows DPAPI 加密写文件
+    # （界面自己不再写明文文件，避免密码留在硬盘上）
     param([string]$User, [string]$Password)
-    $text = "# 校园网上网账号（此文件只在本机保存，请勿外传）`r`nCAMPUS_USER=$User`r`nCAMPUS_PASSWORD=$Password`r`n"
-    [System.IO.File]::WriteAllText($credFile, $text, (New-Object System.Text.UTF8Encoding($false)))
+    $out = Invoke-Py -PyArgs @($mainPy, '--save-cred') -EnvExtra @{
+        HTU_NEW_USER = $User
+        HTU_NEW_PWD  = $Password
+    }
+    if ($out -match 'SAVE_CRED=OK') {
+        $tail = (($out -split "`r?`n" | Where-Object { $_ -match 'SAVE_CRED=OK' }) | Select-Object -First 1)
+        Write-Log2 ('账号已保存：' + $User + '（Windows 加密，只有本机当前用户能解开）')
+        $script:Summary = $null          # 让状态栏下次刷新时重新取
+        return $true
+    }
+    $why = ($out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+    Write-Log2 ('账号保存失败：' + $why)
+    return $false
 }
 
 # ---------------- 作者信息 ----------------
 
-$APP_VERSION = '1.0.0'
+$APP_VERSION = '1.1.0'
 $AUTHOR_NAME = '梅川逸夫'
 $AUTHOR_ID   = ''
 
@@ -224,7 +254,9 @@ function Show-About {
         '版本 v' + $APP_VERSION + '（免费开源，MIT 许可）',
         '直接填学号和密码就能用，不需要注册码。',
         '',
-        '账号密码只保存在你自己电脑上，不会上传到任何服务器。'
+        '账号密码用 Windows DPAPI 加密保存在本机，',
+        '只有这台电脑上的当前 Windows 用户能解开；',
+        '复制到别的电脑或别的账户都解不开，也不会上传到任何服务器。'
     ) -join "`r`n"
     [void][System.Windows.Forms.MessageBox]::Show($msg, '关于本工具', 'OK', 'Information')
 }
@@ -235,10 +267,20 @@ if ($Check) {
     Write-Host "任务脚本  : $(Test-Path $taskPs1)"
     # 自检模式直接查（不走界面缓存），这样能反映真实状态
     $sum = Invoke-Py @($mainPy, '--info')
-    $sj = ($sum -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-    if ($sj -match '^\s*\{') {
+    $sj = ($sum -split "`r?`n" | Where-Object { $_.Trim() -match '^\{' } | Select-Object -First 1)
+    if ($sj) {
+        $sj = $sj.Trim()
         $o = $sj | ConvertFrom-Json
+        Write-Host ("程序版本  : v{0}" -f $o.version)
         Write-Host ("账号状态  : {0}" -f $(if ($o.has_cred) { '已保存学号密码' } else { '未保存' }))
+        $csMap = @{
+            'dpapi'         = '已加密（Windows DPAPI，只有本机当前用户能解开）'
+            'plain'         = '明文保存（旧格式，下次运行会自动加密）'
+            'none'          = '还没有账号文件'
+            'undecryptable' = '解不开（换了电脑/账户或文件被改过，需要重新填写）'
+        }
+        $cs = [string]$o.cred_state
+        Write-Host ("账号文件  : {0}" -f $(if ($csMap.ContainsKey($cs)) { $csMap[$cs] } else { $cs }))
         Write-Host ("网络状态  : {0}" -f $(if ($o.online) { '已联网' } else { '未认证' }))
     } else {
         Write-Host "账号状态  : （--info 读取失败）" -ForegroundColor Yellow
@@ -476,12 +518,22 @@ function Update-State {
     $net = Get-NetState
     $tsk = Get-TaskState
     $hasCred = [bool]($script:Summary -and $script:Summary.has_cred)
+    $credState = [string]$(if ($script:Summary) { $script:Summary.cred_state } else { '' })
+
+    $credText = '未保存'
+    if ($hasCred) {
+        if ($credState -eq 'dpapi') { $credText = '已保存（Windows 加密，开机自动连）' }
+        else { $credText = '已保存（明文旧格式，重新保存一次即可加密）' }
+    } elseif ($credState -eq 'undecryptable') {
+        $credText = '账号文件解不开，请重新填写学号密码并保存'
+    }
 
     $l1 = '网络：{0}      自动连接：{1}' -f $net.text, $tsk.text
-    $l2 = '账号：{0}' -f $(if ($hasCred) { '已保存（开机自动连）' } else { '未保存' })
+    $l2 = '账号：{0}' -f $credText
     $lblState.Text = $l1 + "`r`n" + $l2
 
-    if ($hasCred) { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(0, 110, 0) }
+    if ($credState -eq 'undecryptable') { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(190, 30, 30) }
+    elseif ($hasCred) { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(0, 110, 0) }
     elseif ($script:Summary) { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(190, 60, 0) }
     else { $lblState.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60) }
 }
@@ -556,8 +608,13 @@ $btnInstall.Add_Click({
     if (-not $user) { [System.Windows.Forms.MessageBox]::Show('请输入学号', '提示'); return }
     if (-not $pwd) { [System.Windows.Forms.MessageBox]::Show('请输入上网密码', '提示'); return }
 
-    Save-Cred -User $user -Password $pwd
-    Write-Log2 "已保存账号：$user"
+    if (-not (Save-Cred -User $user -Password $pwd)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "账号没能保存到本机，请看日志窗口里的原因。`r`n`r`n" +
+            "常见原因：磁盘只读 / 杀毒软件拦截写入 / 程序目录被系统保护。",
+            '保存失败', 'OK', 'Warning')
+        return
+    }
     Write-Log2 '正在验证账号密码…'
     # 这一步要联网（在校外会稍慢），放到后台跑，界面不卡；跑完自动继续安装
     $ok = Start-PyAsync -PyArgs @($mainPy, '--force') -BusyText '正在验证账号密码' -TimeoutSec 60 -OnDone {
@@ -583,6 +640,8 @@ $btnTest.Add_Click({
         if ($code -eq 4) {
             Write-Log2 '提示：当前不在校园网（连不上认证服务器）。连着手机热点/家里网时这是正常的。'
         } elseif ($code -eq 3) {
+            Write-Log2 '⚠ 账号文件解不开，请重新填写学号密码后点【保存并安装】'
+            Update-SummaryAsync -Force
         }
         $script:NetState = $null      # 让状态栏重新检测
         Update-NetStateAsync
@@ -716,9 +775,30 @@ function Report-Summary {
     $script:SummaryReported = $true
     $s = $script:Summary
     if ($s.pwd) { Write-Log2 '已回填本机保存的密码（打码显示，勾"显示密码"可以核对）' }
-    if ($s.cred_ok -eq 'FAIL') {
-    } elseif ($s.cred_ok -eq 'NOCRED') {
-        Write-Log2 '（本机还没保存账号密码，首次使用请填学号和密码）'
+
+    switch ([string]$s.cred_state) {
+        'dpapi' {
+            Write-Log2 '账号文件：已用 Windows 加密保存（只有本机当前 Windows 用户能解开）'
+        }
+        'plain' {
+            Write-Log2 '账号文件：检测到 v1.0.0 的明文格式，已自动升级为加密保存'
+        }
+        'undecryptable' {
+            Write-Log2 '⚠ 账号文件解不开（credentials.dat）：换了电脑 / 换了 Windows 用户 / 文件被改动过'
+            Write-Log2 '   请重新输入学号和上网密码，点【保存并安装】即可恢复（坏文件会被覆盖）'
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "本机保存的账号文件解不开了。`r`n`r`n" +
+                "常见原因：`r`n" +
+                "· 把程序文件夹从别的电脑复制过来的`r`n" +
+                "· 换了 Windows 登录账户`r`n" +
+                "· 文件被工具软件改动过`r`n`r`n" +
+                "解决办法：重新输入一次学号和上网密码，点【保存并安装】。`r`n`r`n" +
+                "（这是加密的正常表现：账号只在这台电脑的这个 Windows 账户里能解开）",
+                '账号需要重新填写', 'OK', 'Warning')
+        }
+        default {
+            Write-Log2 '（本机还没保存账号密码，首次使用请填学号和密码）'
+        }
     }
 }
 

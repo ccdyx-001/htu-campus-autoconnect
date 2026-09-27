@@ -2,7 +2,7 @@
 
 > 开机自动连校园网，掉线自动重连 —— **免安装、带图形界面、内置运行库，下载解压双击就能用**。
 
-**当前版本：`v1.0.0`** · [更新日志](CHANGELOG.md) · [报告问题](../../issues)
+**当前版本：`v1.1.0`** · [更新日志](CHANGELOG.md) · [报告问题](https://github.com/ccdyx-001/htu-campus-autoconnect/issues)
 
 给同学写的小工具：河师大校园网每次都要手动打开认证页面输账号密码，太烦了。
 这个程序会常驻后台，开机自动认证、断网 1 分钟内自动重连，全程无窗口打扰。
@@ -24,12 +24,12 @@
 - **免安装运行库**：内置 Python 3.12，电脑上不需要装 Python、不需要 pip
 - **兼容代理软件**：Clash / Watt Toolkit 等开着也能用（校园网请求强制直连）
 - **校外不卡界面**：连着手机热点时 2 秒内判断"不在校园网"，界面全程可操作
-- **隐私**：账号密码只存在你自己电脑上（安装后位于 `%LOCALAPPDATA%\HTUAutoConnect\credentials.env`），不上传任何服务器
+- **隐私**：账号密码用 Windows DPAPI **加密**后存在你自己电脑上（`%LOCALAPPDATA%\HTUAutoConnect\credentials.dat`），只有本机当前 Windows 用户能解开，不上传任何服务器
 - **纯标准库**：100% Python 标准库实现，源码可读可改
 
 ## 快速开始
 
-1. 到 [Releases](https://github.com/ccdyx-001/htu-campus-autoconnect/releases/latest) 下载 `htu-campus-autoconnect_v1.0.0.zip`（发布包用英文名，避免 GitHub 截断中文文件名），解压到任意位置（桌面也行）
+1. 到 [Releases](https://github.com/ccdyx-001/htu-campus-autoconnect/releases/latest) 下载 `htu-campus-autoconnect_v1.1.0.zip`（发布包用英文名，避免 GitHub 截断中文文件名），解压到任意位置（桌面也行）
 2. 双击 **`点我启动.bat`**
 3. 在窗口里填：**学号** → **上网密码** → 点【保存并安装】
 4. 弹出管理员权限确认框时点 **【是】**（注册开机自启任务需要）
@@ -40,7 +40,7 @@
 ## 目录结构
 
 ```
-校园网自动连接_v1.0.0\      ← 解压后得到的文件夹
+校园网自动连接_v1.1.0\      ← 解压后得到的文件夹
 ├── 点我启动.bat          ← 双击这个
 ├── 卸载.bat
 ├── 使用说明.txt
@@ -80,8 +80,8 @@
 
 ```
 C:\Users\你的用户名\AppData\Local\HTUAutoConnect\
-├── credentials.env      ← 你的学号 + 上网密码
-├── .user                ← 你的学号（界面回显用）
+├── credentials.dat      ← 你的学号 + 上网密码（Windows DPAPI 加密，记事本打开是乱码）
+├── .user                ← 你的学号（界面显示用，不含密码）
 ├── autoconnect.log      ← 运行日志（含学号和本机 IP）
 └── runtime\             ← 内置的 Python 运行库
 ```
@@ -102,10 +102,17 @@ C:\Users\你的用户名\AppData\Local\HTUAutoConnect\
 
 ### 安全边界（诚实说明）
 
-- 当前版本 `credentials.env` 是**明文保存**的：任何能打开你这台电脑的人都能看到它 ⚠️
-- 所以：**别把电脑借给不信任的人，也别把这个文件夹直接拷给别人** ✓
-- 📌 后续计划：改用 **Windows DPAPI** 加密保存（绑定你的 Windows 账户，
-  文件被拷到别的电脑或别的账户就解不开）✓
+- 账号文件 `credentials.dat` 用 **Windows DPAPI 加密**保存，密钥由 Windows 掌管，
+  绑定「这台电脑 + 当前 Windows 登录账户」✓
+  - 用记事本打开只能看到乱码，看不到密码 ✓
+  - 复制到别的电脑 / 别的 Windows 账户 → 解不开（这是故意的）✓
+  - 被别的软件改动过 → 解不开 ✓
+  - 遇到这几种情况：重新填一次学号密码、点【保存并安装】即可恢复 ✓
+- 从 v1.0.0 升级：第一次运行时会自动把旧的明文 `credentials.env`
+  加密成 `credentials.dat`，并删除明文文件（升级失败会保留明文，保证功能不受影响）✓
+- 仍然要说清楚：**程序运行期间密码在内存里**，本机管理员、或者能直接操作你这台电脑的人
+  依然有办法拿到它。加密挡住的是"文件被拷走给别人看"和"别的用户偷看文件"，
+  不能代替给电脑设登录密码 ⚠️
 - 日志 `autoconnect.log` 里会记录学号与本机 IP（排查问题需要），不想留可以删 ✓
 
 ### 卸载会删掉什么
@@ -113,7 +120,7 @@ C:\Users\你的用户名\AppData\Local\HTUAutoConnect\
 双击 `卸载.bat`（或在「设置 → 应用」里卸载）会删除：
 
 - 开机自启的计划任务 ✓
-- `credentials.env` / `.user`（账号信息）✓
+- `credentials.dat` / `.user`（账号信息，卸载时可以自己选保留还是删除）✓
 - 桌面快捷方式、注册表卸载条目 ✓
 - 运行日志（可选，默认保留）✓
 
