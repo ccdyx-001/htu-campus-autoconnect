@@ -3,6 +3,7 @@
 """
 ============================================================
  河南师范大学  校园网自动连接工具
+ 作者：梅川逸夫
 ============================================================
  功能：
    · 开机自动认证，断网自动重连（配合计划任务，每分钟检查一次）
@@ -11,18 +12,22 @@
    · 纯 Python 标准库实现，无需 pip 安装任何第三方库
 
  使用方法（普通用户看这里）：
-   双击 install.bat 即可，按提示输入学号和密码
+   双击上一层的【点我启动.bat】，在窗口里填学号和密码，
+   点【激活】再点【保存并安装】即可（程序会自动安装到本机）。
 
  命令行用法（进阶）：
    python AutoConnect_htu.py --setup            交互式配置账号密码
    python AutoConnect_htu.py                    检测网络，未联网才认证
    python AutoConnect_htu.py --force            强制认证一次（测试用）
    python AutoConnect_htu.py --logout           主动下线
+   python AutoConnect_htu.py --status           只报告当前是否已联网
    python AutoConnect_htu.py 学号 密码           直接指定账号密码
 
- 账号密码保存在同目录的 credentials.env 中（只存在你本机，不会上传）
+ 账号密码保存在同目录的 credentials.env（只存在你本机，不会上传）
 ============================================================
 """
+import datetime
+import email.utils
 import json
 import os
 import socket
@@ -32,6 +37,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+
 
 # ---- 河师大默认认证服务器（未认证时脚本会自动探测真实地址）----
 DEFAULT_PORTAL = "http://10.101.2.194:6060"
@@ -65,9 +71,29 @@ except Exception:
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _direct_open(url, timeout=15):
+def _direct_open(url, timeout=6):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     return _DIRECT_OPENER.open(req, timeout=timeout)
+
+
+def campus_reachable(timeout=2):
+    """快速判断"现在是不是在校园网里"（连得上认证服务器）
+
+    为什么需要它：在校外用手机热点时，认证服务器(10.x)完全不可达，
+    如果照常往下走（探测 3 个地址 × 8 秒 + 3 次登录重试 × 15 秒），
+    要干等近 100 秒，界面就会显示"无响应"。
+    这里先花最多 2 秒探一下，不在校园网就立刻收工。
+    """
+    host = urllib.parse.urlparse(PORTAL).hostname
+    port = urllib.parse.urlparse(PORTAL).port or 80
+    if not host:
+        return True          # 解析不出来就别拦着
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
 
 
 def log(msg):
@@ -122,9 +148,23 @@ def save_credentials_file(user, password):
         f.write("CAMPUS_PASSWORD={0}\n".format(password))
 
 
+# ---- 账号配置文件 ----
+
+
+def get_credentials():
+    """读取账号密码，返回 (user, password, mode)
+
+    mode: plain=读到了 / none=没配置
+    """
+    load_credentials_file()
+    u = os.environ.get("CAMPUS_USER", "")
+    p = os.environ.get("CAMPUS_PASSWORD", "")
+    return u, p, ("plain" if (u and p) else "none")
+
+
 # ---------------- 网络探测 ----------------
 
-def discover_portal(timeout=8):
+def discover_portal(timeout=3):
     """未认证时，通过 AC 重定向自动识别认证服务器地址与 AC 名称。
 
     已认证状态下不会发生重定向，此时保持默认值即可。
@@ -203,7 +243,7 @@ def get_mac():
     return ":".join("{0:02x}".format((n >> shift) & 0xff) for shift in range(40, -1, -8))
 
 
-def is_online(timeout=5):
+def is_online(timeout=3):
     """严格联网检测：必须 HTTP 204 且未被重定向
 
     未认证时校园网 AC 会把请求劫持到认证页（返回 200/302），不能算联网成功。
@@ -224,13 +264,13 @@ def is_online(timeout=5):
         return False
 
 
-def http_get_text(url, timeout=15):
+def http_get_text(url, timeout=6):
     with _direct_open(url, timeout=timeout) as r:
         raw = r.read()
         return r.status, raw.decode("utf-8", "ignore"), r.geturl()
 
 
-def http_get_json(url, timeout=15):
+def http_get_json(url, timeout=6):
     status, text, final = http_get_text(url, timeout=timeout)
     if final and final != url:
         log("请求被重定向到：{0}".format(final[:120]))
@@ -290,7 +330,7 @@ def notify(title, message):
         pass
 
 
-def do_login(user, password, attempts=3):
+def do_login(user, password, attempts=2):
     """执行一次认证，返回 (是否成功, 提示信息, 错误码)"""
     params, ip, info = build_params(user, password)
     url = "{0}/quickauth.do?".format(PORTAL) + urllib.parse.urlencode(params)
@@ -305,7 +345,7 @@ def do_login(user, password, attempts=3):
             last_err = "{0}: {1}".format(type(e).__name__, e)
             log("请求失败：{0}".format(last_err))
             if n < attempts:
-                time.sleep(3)
+                time.sleep(2)
             continue
 
         code = str(data.get("code"))
@@ -323,7 +363,42 @@ def do_login(user, password, attempts=3):
     return False, "网络请求超时：" + str(last_err), "-1"
 
 
+def fetch_server_date():
+    """从校园网认证服务器读取权威时间（HTTP 响应头里的 Date 字段）。
+
+    用途：判断用户是否把系统时间调错了。服务器时间比本地时间可信得多，
+    而且不增加额外负担（本来就要访问认证服务器，且是内网直连）。
+    """
+    try:
+        url = "{0}/portal/getRemoteAddr.do?rand={1}".format(PORTAL, int(time.time() * 1000))
+        with _direct_open(url, timeout=6) as r:
+            dt = r.headers.get("Date")
+        if not dt:
+            return None
+        return email.utils.parsedate_to_datetime(dt).date()
+    except Exception:
+        return None
+
+
 def login(user, password, force=False):
+    t_start = time.time()
+
+    # ---- 先花最多 2 秒确认"在不在校园网"，不在就立刻收工（避免界面卡死）----
+    if not campus_reachable():
+        if is_online(timeout=2):
+            log_heartbeat("当前已联网（不在校园网，可能是热点/家里网）[OK]")
+            return 0
+        # 用 log_heartbeat：每分钟跑一次任务也不会把日志刷爆（最多每 30 分钟记一条）
+        log_heartbeat("当前不在校园网（连不上认证服务器 {0}），已跳过认证".format(PORTAL))
+        return 4
+
+    # ---- 顺带看一下系统时间准不准（服务器时间比本地可信）----
+    sd = fetch_server_date()
+    if sd is not None:
+        gap = abs((sd - datetime.date.today()).days)
+        if gap >= 2:
+            log_heartbeat("提示：系统时间与校园网服务器相差 {0} 天（服务器 {1}），建议校准".format(gap, sd.isoformat()))
+
     if not force and is_online():
         log_heartbeat("当前已联网，无需认证 [OK]")
         return 0
@@ -331,10 +406,31 @@ def login(user, password, force=False):
         discover_portal()
     ok, msg, code = do_login(user, password)
     notify("校园网连接", msg)
+    log("本次耗时 {0:.1f} 秒".format(time.time() - t_start))
     return 0 if ok else 1
 
 
+
+def print_info():
+    """给图形界面用：一次性输出账号/网络状态（JSON）"""
+    load_credentials_file()
+    u = os.environ.get("CAMPUS_USER", "")
+    p = os.environ.get("CAMPUS_PASSWORD", "")
+    try:
+        import socket as _sock
+        _s = _sock.create_connection(("connect.rom.miui.com", 80), timeout=2)
+        _s.close()
+        online = True
+    except Exception:
+        online = False
+    print(json.dumps({"user": u, "pwd": p, "online": online,
+                      "has_cred": bool(u and p)}, ensure_ascii=False))
+
+
 def logout():
+    if not campus_reachable():
+        log("当前不在校园网（连不上认证服务器），无需下线")
+        return 0
     params, ip, _ = build_params("", "", force_suffix=False)
     params.pop("userid", None)
     params.pop("passwd", None)
@@ -350,6 +446,7 @@ def logout():
 
 
 # ---------------- 交互式配置 ----------------
+
 
 def setup():
     """交互式配置入口：用户按 Ctrl+C 或提前关闭窗口时优雅退出，不报错栈"""
@@ -388,8 +485,9 @@ def _setup_interactive():
         print("\n正在验证账号密码（连接认证服务器）...")
         ok, msg, code = do_login(user, password, attempts=1)
         if ok:
+            print("\n  ✅ 认证成功！账号密码正确")
             save_credentials_file(user, password)
-            print("\n  ✅ 认证成功！账号密码正确，已保存到 credentials.env")
+            print("\n  全部配置完成，可以开始使用了！")
             return 0
         if code == "7":
             print("\n  ✗ 账号或密码不正确，请重新输入\n")
@@ -398,8 +496,8 @@ def _setup_interactive():
         print("     可能原因：① 没连校园网 ② 校园网欠费 ③ 认证服务器暂时不可用")
         ans = input("     仍然保存这组账号密码吗？(y=保存 / n=重新输入) ").strip().lower()
         if ans == "y":
-            save_credentials_file(user, password)
             print("\n  ✅ 已保存（当前环境无法验证，回学校后会自动生效）")
+            save_credentials_file(user, password)
             return 0
     print("\n  ✗ 尝试次数过多，安装中止")
     return 1
@@ -414,15 +512,28 @@ def main():
         return setup()
     if "--logout" in argv:
         return logout()
+    if "--info" in argv:
+        print_info()
+        return 0
+    if "--status" in argv:
+        # 供图形界面调用：只报告当前是否已认证（严格判定：204 且未被 AC 劫持）
+        print("ONLINE" if is_online() else "OFFLINE")
+        return 0
 
     rest = [a for a in argv if not a.startswith("--")]
-    user = rest[0] if len(rest) > 0 else os.environ.get("CAMPUS_USER", "")
-    password = rest[1] if len(rest) > 1 else os.environ.get("CAMPUS_PASSWORD", "")
+    user, password, mode = get_credentials()
+    if len(rest) >= 2:                      # 命令行直接给了账号密码
+        user, password, mode = rest[0], rest[1], "argv"
 
+    if mode == "sealed-fail":
+        return 3
     if not user or not password:
         log("缺少账号/密码：请先运行  python AutoConnect_htu.py --setup  完成配置")
         return 2
-    return login(user, password, force=force)
+
+    rc = login(user, password, force=force)
+
+    return rc
 
 
 if __name__ == "__main__":

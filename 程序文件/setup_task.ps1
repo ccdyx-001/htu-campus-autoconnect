@@ -1,10 +1,10 @@
 ﻿<#
 ============================================================
  校园网自动连接 - 计划任务注册/卸载脚本
- 由 install.bat 自动调用；脚本会自行请求管理员权限
+ 由图形界面（界面.ps1 / 安装模块.ps1）以管理员权限调用；脚本也能自行请求提权
 
  参数：
-   -PythonExe <路径>   指定 Python 解释器（install.bat 自动传入）
+   -PythonExe <路径>   指定 Python 解释器（安装时自动传入）
    -TaskName  <名称>   计划任务名称（默认 HTU Campus AutoConnect）
    -Uninstall          卸载：删除计划任务
 
@@ -74,7 +74,8 @@ try {
 
     $mainScript = Join-Path $scriptDir "AutoConnect_htu.py"
     if (-not (Test-Path $mainScript)) { throw "找不到主脚本：$mainScript" }
-    if (-not (Test-Path (Join-Path $scriptDir "credentials.env"))) { throw "还没有配置账号密码，请先运行 install.bat" }
+    $hasCred = (Test-Path (Join-Path $scriptDir "credentials.dat")) -or (Test-Path (Join-Path $scriptDir "credentials.env"))
+    if (-not $hasCred) { throw "还没有配置账号密码，请先双击【点我启动.bat】完成配置" }
 
     $action = New-ScheduledTaskAction -Execute $exe -Argument "`"$mainScript`"" -WorkingDirectory $scriptDir
 
